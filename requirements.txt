@@ -1,0 +1,5 @@
+yt-dlp>=2026.1.1
+gallery-dl>=1.32.4
+telethon>=1.36.0
+PySocks>=1.7.1
+python-socks[asyncio]>=2.4.0
