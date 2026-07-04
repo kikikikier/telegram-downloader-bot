@@ -1,40 +1,28 @@
 # Telegram Downloader Bot
 
-Project id: `telegram-downloader-bot`
+> Vibe coding note: this project is a full vibe coding artifact: human-directed, AI-assisted, iteratively debugged and shipped.
 
-Example server path:
-
-```text
-/home/codex/telegram-downloader-bot
-```
-
-## Purpose
-
-Telegram bot that downloads public media links from YouTube, TikTok, Pinterest, Instagram, VK Video, Rutube, and direct media URLs. It sends back a media preview plus the raw file/document.
+Telegram bot for downloading public media links and sending the result back as a Telegram media preview plus a raw file/document.
 
 Use it only for media you own, are allowed to download, or are otherwise permitted to process.
 
-## Known Files
+## Supported Sources
 
-- `bot.py`
-- `mtproto_upload.py`
-- `requirements.txt`
-- `start.sh`
-- `stop.sh`
-- `status.sh`
-- `proxy-start.sh`
-- `proxy-stop.sh`
-- `README.md`
+- YouTube
+- TikTok
+- Pinterest
+- Instagram
+- VK Video
+- Rutube
+- Direct media URLs
 
-## Runtime
+## How It Works
 
-- Python venv.
-- `yt-dlp`.
-- `gallery-dl` for Instagram video first-pass downloads.
-- `ffmpeg`.
-- Local sing-box proxy on `127.0.0.1:18080`.
-- Optional local Telegram Bot API server for files up to 2000 MB.
-- Optional MTProto upload through Telethon for files larger than the cloud Bot API limit.
+- Uses `yt-dlp` for most supported platforms.
+- Uses `gallery-dl` as the first download route for Instagram videos, with `yt-dlp` as a fallback.
+- Prefers already-combined MP4 video with H.264/AAC codecs when available.
+- Keeps FFmpeg merging disabled by default to avoid slow server-side video processing.
+- Can use an HTTP/SOCKS proxy for Telegram, yt-dlp, gallery-dl, direct media requests, and MTProto uploads.
 
 ## Video Format
 
@@ -44,11 +32,32 @@ Instagram videos use `gallery-dl` first and fall back to `yt-dlp` if that route 
 
 FFmpeg merge is disabled by default. Set `BOT_ENABLE_FFMPEG_MERGE=1` only if you want yt-dlp to fall back to separate video/audio streams and remux them into MP4.
 
-## Last Known Status
+## Requirements
 
-- Bot running.
-- Proxy running.
-- Telegram direct access from VPS required proxy.
+- Python 3.10+
+- Python packages from `requirements.txt`
+- Optional FFmpeg for audio extraction, media splitting, or explicit yt-dlp merge fallback
+- Optional local Telegram Bot API server for larger bot uploads
+- Optional Telegram API credentials for MTProto uploads through Telethon
+
+## Configuration
+
+Create a local `.env` from `.env.example` and set at least:
+
+```env
+TELEGRAM_BOT_TOKEN=replace_me
+```
+
+Useful optional settings:
+
+```env
+BOT_YTDLP_PROXY=http://127.0.0.1:PORT
+BOT_GALLERY_DL_PROXY=http://127.0.0.1:PORT
+BOT_TELEGRAM_PROXY=http://127.0.0.1:PORT
+BOT_ENABLE_FFMPEG_MERGE=0
+BOT_MAX_MB=49
+BOT_LARGE_UPLOAD_MODE=document
+```
 
 ## Large Files
 
@@ -57,35 +66,29 @@ Upload route:
 1. If the file fits `BOT_MAX_MB`, send through Bot API.
 2. If `BOT_API_LOCAL=1` and `BOT_API_BASE` points to a local `telegram-bot-api --local` server, Bot API can upload up to 2000 MB using `file://` local paths.
 3. If `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are configured, files over cloud Bot API limits are sent through MTProto/Telethon.
-4. If MTProto is unavailable or fails, ffmpeg splits media into playable parts.
+4. If MTProto is unavailable or fails, FFmpeg splits media into playable parts.
 
-Important: cloud `api.telegram.org` still has the classic bot upload limit. For serious large files, use either local Bot API server or MTProto credentials.
+Cloud `api.telegram.org` still has the classic bot upload limit. For serious large files, use either a local Bot API server or MTProto credentials.
 
-## Server Logs
-
-```bash
-cd /home/codex/telegram-downloader-bot
-./logs.sh
-```
-
-For more detail:
+## Run
 
 ```bash
-cd /home/codex/telegram-downloader-bot
-echo 'BOT_LOG_LEVEL=DEBUG' >> .env
-./stop.sh
-./start.sh
-./logs.sh
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python bot.py
 ```
 
-Quick diagnostics:
+The helper scripts `start.sh`, `stop.sh`, `status.sh`, and `logs.sh` are optional convenience wrappers for Unix-like environments.
+
+## Test
 
 ```bash
-cd /home/codex/telegram-downloader-bot
-chmod +x diagnose.sh logs.sh
-./diagnose.sh
+python -m unittest test_bot.py
 ```
 
-## Vibe Coding Note
+## Related Docs
 
-This project is a full vibe coding artifact: human-directed, AI-assisted, iteratively debugged and shipped.
+- `features.md`
+- `large-file-methods.md`
+- `local-bot-api-server.md`

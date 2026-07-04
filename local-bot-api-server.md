@@ -51,9 +51,7 @@ tail -f /var/log/telegram-bot-api.log
 Then restart this bot:
 
 ```bash
-cd /home/codex/telegram-downloader-bot
 ./stop.sh
 ./start.sh
 ./logs.sh
 ```
-
