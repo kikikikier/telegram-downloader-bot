@@ -2,12 +2,6 @@
 
 Project id: `telegram-downloader-bot`
 
-Bot username:
-
-```text
-@Faylismertibot
-```
-
 Example server path:
 
 ```text
