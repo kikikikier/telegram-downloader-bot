@@ -18,6 +18,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from replicas import ACCEPT_MESSAGES, DOWNLOADED_MESSAGES, FILE_READY_MESSAGES
+
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -163,7 +165,7 @@ OPTIONS_PROMPT_MESSAGES = (
     "В каком виде принести благодать?",
     "Ссылка открылась. Выберите, что вынести из коридора.",
 )
-ACCEPT_MESSAGES = (
+_LEGACY_ACCEPT_MESSAGES = (
     "Принял ссылку. Ожидайте. Не верьте дверным ручкам.",
     "Ссылка у меня. Поставил её на тихий огонь благодати.",
     "Забрал ссылку в коридор. Дверные ручки под наблюдением.",
@@ -173,7 +175,7 @@ SELECTED_MESSAGES = (
     "{label}: принято. Коридор уже шуршит.",
     "{label}: понёс. Дверные ручки предупреждены.",
 )
-DOWNLOADED_MESSAGES = (
+_LEGACY_DOWNLOADED_MESSAGES = (
     "Файл добрался до прихожей. Отправляю дальше.",
     "Сверток найден. Благодать идёт по коридору.",
     "Добыча у меня. Сейчас передам, пока ручки не передумали.",
@@ -211,12 +213,12 @@ ERROR_MESSAGES = (
     "Ссылка сопротивлялась сильнее обычного. Попробуйте ещё раз позже.",
     "Благодать застряла по дороге. Я записал следы в журнал.",
 )
-DOCUMENT_CAPTIONS = (
+_LEGACY_DOCUMENT_CAPTIONS = (
     "Вот он. Не верьте дверным ручкам.",
     "Доставлено. Благодать слегка помята, но жива.",
     "Сверток прибыл.",
 )
-DOCUMENT_AFTER_PREVIEW_CAPTIONS = (
+_LEGACY_DOCUMENT_AFTER_PREVIEW_CAPTIONS = (
     "И ещё чистым файлом, чтобы благодать не мялась.",
     "Дубль без витрины. На всякий случай.",
     "Тот же сверток, только без церемоний.",
@@ -1177,7 +1179,8 @@ def mtproto_upload_available() -> bool:
 
 def send_large_media_via_mtproto(chat_id: int, path: Path) -> None:
     send_message(chat_id, pick(LARGE_SEND_MESSAGES))
-    run_mtproto_upload(chat_id, path, caption=pick(DOCUMENT_CAPTIONS), mode=LARGE_UPLOAD_MODE)
+    send_message(chat_id, pick(FILE_READY_MESSAGES))
+    run_mtproto_upload(chat_id, path, caption="", mode=LARGE_UPLOAD_MODE)
 
 
 def run_mtproto_upload(chat_id: int, path: Path, caption: str, mode: str) -> None:
@@ -1205,7 +1208,11 @@ def run_mtproto_upload(chat_id: int, path: Path, caption: str, mode: str) -> Non
 
 
 def send_small_media_and_document(chat_id: int, path: Path, caption_prefix: str = "") -> None:
-    caption = caption_prefix or pick(DOCUMENT_CAPTIONS)
+    if caption_prefix:
+        send_message(chat_id, caption_prefix)
+    else:
+        send_message(chat_id, pick(FILE_READY_MESSAGES))
+    caption = ""
     if path.stat().st_size > PREVIEW_MAX_BYTES:
         logger.info(
             "skip preview over preview limit file=%s size=%s preview_limit=%s",
@@ -1217,7 +1224,7 @@ def send_small_media_and_document(chat_id: int, path: Path, caption_prefix: str 
         return
     preview_sent = send_media_preview(chat_id, path, caption)
     if preview_sent:
-        send_document(chat_id, path, caption=pick(DOCUMENT_AFTER_PREVIEW_CAPTIONS))
+        send_document(chat_id, path, caption="")
     else:
         send_document(chat_id, path, caption=caption)
 

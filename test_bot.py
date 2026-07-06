@@ -153,5 +153,43 @@ class YtdlpFormatTests(unittest.TestCase):
         self.assertNotIn("+ba", selector)
 
 
+class UserReplicaTests(unittest.TestCase):
+    def test_main_user_replica_sets_have_200_unique_messages_each(self):
+        replica_sets = (
+            bot.ACCEPT_MESSAGES,
+            bot.DOWNLOADED_MESSAGES,
+            bot.FILE_READY_MESSAGES,
+        )
+
+        for messages in replica_sets:
+            with self.subTest(first_message=messages[0]):
+                self.assertEqual(200, len(messages))
+                self.assertEqual(200, len(set(messages)))
+
+    def test_small_upload_announces_ready_separately_and_uses_empty_captions(self):
+        media = FakeFile("download.mp4", size=1024)
+
+        with patch.object(bot, "send_message") as send_message:
+            with patch.object(bot, "send_media_preview", return_value=True) as send_preview:
+                with patch.object(bot, "send_document") as send_document:
+                    bot.send_small_media_and_document(123, media)
+
+        send_message.assert_called_once()
+        self.assertIn(send_message.call_args.args[1], bot.FILE_READY_MESSAGES)
+        send_preview.assert_called_once_with(123, media, "")
+        send_document.assert_called_once_with(123, media, caption="")
+
+    def test_mtproto_upload_announces_ready_separately_and_uses_empty_caption(self):
+        media = FakeFile("large.mp4", size=1024)
+
+        with patch.object(bot, "send_message") as send_message:
+            with patch.object(bot, "run_mtproto_upload") as upload:
+                bot.send_large_media_via_mtproto(123, media)
+
+        self.assertEqual(2, send_message.call_count)
+        self.assertIn(send_message.call_args_list[1].args[1], bot.FILE_READY_MESSAGES)
+        upload.assert_called_once_with(123, media, caption="", mode=bot.LARGE_UPLOAD_MODE)
+
+
 if __name__ == "__main__":
     unittest.main()
