@@ -20,7 +20,7 @@ Use it only for media you own, are allowed to download, or are otherwise permitt
 
 - Uses `yt-dlp` for most supported platforms.
 - Uses `gallery-dl` as the first download route for Instagram and TikTok media posts, with `yt-dlp` as a fallback.
-- Sends all downloaded images from image-only gallery/carousel posts.
+- Sends image-only gallery/carousel posts as Telegram media groups, capped at 10 images per album message.
 - Prefers already-combined MP4 video with H.264/AAC codecs when available.
 - Keeps FFmpeg merging disabled by default to avoid slow server-side video processing.
 - Can use an HTTP/SOCKS proxy for Telegram, yt-dlp, gallery-dl, direct media requests, and MTProto uploads.

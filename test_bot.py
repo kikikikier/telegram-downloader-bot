@@ -147,7 +147,7 @@ class YtdlpFormatTests(unittest.TestCase):
 
         self.assertEqual(["photo-2.jpg", "photo-3.png", "photo-1.jpg"], [path.name for path in paths])
 
-    def test_handle_url_sends_each_downloaded_image_file(self):
+    def test_handle_url_sends_downloaded_images_as_one_gallery_album(self):
         paths = [
             FakeFile("photo-1.jpg", size=1_000_000, mtime=1),
             FakeFile("photo-2.jpg", size=2_000_000, mtime=2),
@@ -160,10 +160,44 @@ class YtdlpFormatTests(unittest.TestCase):
                     with patch.object(bot, "download_media_files_for_url", create=True, return_value=paths):
                         with patch.object(bot, "download_media_for_url", return_value=paths[0]):
                             with patch.object(bot, "send_message"):
+                                with patch.object(bot, "send_image_gallery") as send_gallery:
+                                    with patch.object(bot, "send_media_and_document") as send_media:
+                                        bot.handle_url(123, "https://www.instagram.com/p/ABC123/")
+
+        send_gallery.assert_called_once_with(123, paths)
+        send_media.assert_not_called()
+
+    def test_image_gallery_uses_media_groups_and_caps_at_telegram_limit(self):
+        paths = [
+            FakeFile(f"photo-{index}.jpg", size=1_000_000 + index, mtime=index)
+            for index in range(12)
+        ]
+
+        with patch.object(bot, "send_message") as send_message:
+            with patch.object(bot, "send_media_group") as send_group:
+                bot.send_image_gallery(123, paths)
+
+        send_message.assert_called_once()
+        self.assertIn(send_message.call_args.args[1], bot.FILE_READY_MESSAGES)
+        self.assertEqual(2, send_group.call_count)
+        self.assertEqual(("photo", paths[:10]), send_group.call_args_list[0].args[1:])
+        self.assertEqual(("document", paths[:10]), send_group.call_args_list[1].args[1:])
+
+    def test_single_image_still_uses_existing_single_file_route(self):
+        path = FakeFile("photo-1.jpg", size=1_000_000, mtime=1)
+        workdir = FakeWorkdir([path])
+
+        with patch.object(bot, "TMP_ROOT", FakeTmpRoot(workdir)):
+            with patch.object(bot, "mark_workdir_active"):
+                with patch.object(bot, "schedule_workdir_cleanup"):
+                    with patch.object(bot, "download_media_files_for_url", create=True, return_value=[path]):
+                        with patch.object(bot, "send_message"):
+                            with patch.object(bot, "send_image_gallery") as send_gallery:
                                 with patch.object(bot, "send_media_and_document") as send_media:
                                     bot.handle_url(123, "https://www.instagram.com/p/ABC123/")
 
-        self.assertEqual([path.name for path in paths], [call.args[1].name for call in send_media.call_args_list])
+        send_gallery.assert_not_called()
+        send_media.assert_called_once_with(123, path)
 
     def test_youtube_options_skip_video_only_formats_without_ffmpeg_merge(self):
         fake_info = {

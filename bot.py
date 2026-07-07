@@ -106,6 +106,8 @@ MEDIA_SUFFIXES = {
 }
 VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".m4v", ".mkv"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+PHOTO_ALBUM_SUFFIXES = {".jpg", ".jpeg", ".png"}
+MEDIA_GROUP_LIMIT = 10
 
 SUPPORTED_HOST_HINTS = (
     "youtube.com",
@@ -813,8 +815,11 @@ def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str |
             human_size(total_size),
         )
         send_message(chat_id, pick(DOWNLOADED_MESSAGES))
-        for media_path in media_paths:
-            send_media_and_document(chat_id, media_path)
+        if is_image_gallery(media_paths):
+            send_image_gallery(chat_id, media_paths)
+        else:
+            for media_path in media_paths:
+                send_media_and_document(chat_id, media_path)
         logger.info(
             "job done chat_id=%s files=%s elapsed=%.1fs",
             chat_id,
@@ -1234,6 +1239,27 @@ def send_media_and_document(chat_id: int, path: Path) -> None:
     send_large_media_parts(chat_id, path)
 
 
+def is_image_gallery(paths: list[Path]) -> bool:
+    return len(paths) > 1 and all(path.suffix.lower() in IMAGE_SUFFIXES for path in paths)
+
+
+def send_image_gallery(chat_id: int, paths: list[Path]) -> None:
+    capped = paths[:MEDIA_GROUP_LIMIT]
+    if not capped:
+        return
+    if len(paths) > MEDIA_GROUP_LIMIT:
+        logger.info("image gallery capped files=%s limit=%s", len(paths), MEDIA_GROUP_LIMIT)
+
+    send_message(chat_id, pick(FILE_READY_MESSAGES))
+    photo_paths = [path for path in capped if path.suffix.lower() in PHOTO_ALBUM_SUFFIXES]
+    if len(photo_paths) >= 2:
+        send_media_group(chat_id, "photo", photo_paths)
+    elif len(photo_paths) == 1:
+        send_media_preview(chat_id, photo_paths[0], "")
+
+    send_media_group(chat_id, "document", capped)
+
+
 def mtproto_upload_available() -> bool:
     return bool(TELEGRAM_API_ID and TELEGRAM_API_HASH)
 
@@ -1443,6 +1469,49 @@ def media_method_for_path(path: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
+def send_media_group(chat_id: int, media_kind: str, paths: list[Path]) -> None:
+    if not 2 <= len(paths) <= MEDIA_GROUP_LIMIT:
+        raise ValueError("sendMediaGroup requires 2-10 media items")
+    if media_kind not in {"photo", "document"}:
+        raise ValueError(f"unsupported media group type: {media_kind}")
+
+    media_type = "photo" if media_kind == "photo" else "document"
+    if BOT_API_LOCAL:
+        media = [
+            {
+                "type": media_type,
+                "media": path.resolve().as_uri(),
+            }
+            for path in paths
+        ]
+        logger.info("bot api local media group type=%s files=%s", media_type, len(paths))
+        api_json(
+            "sendMediaGroup",
+            {
+                "chat_id": str(chat_id),
+                "media": json.dumps(media, ensure_ascii=False),
+            },
+            timeout=UPLOAD_TIMEOUT,
+        )
+        return
+
+    media = [
+        {
+            "type": media_type,
+            "media": f"attach://file{index}",
+        }
+        for index, _path in enumerate(paths)
+    ]
+    upload_files(
+        "sendMediaGroup",
+        {
+            "chat_id": str(chat_id),
+            "media": json.dumps(media, ensure_ascii=False),
+        },
+        {f"file{index}": path for index, path in enumerate(paths)},
+    )
+
+
 def api_json(method: str, params: dict | None = None, timeout: int = 60) -> dict:
     data = urllib.parse.urlencode(params or {}).encode()
     req = urllib.request.Request(f"{API_BASE}/{method}", data=data)
@@ -1504,6 +1573,41 @@ def upload_file(
         path.name,
         human_size(path.stat().st_size),
     )
+    with urlopen(req, timeout=UPLOAD_TIMEOUT) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not payload.get("ok"):
+        raise RuntimeError(payload)
+    return payload
+
+
+def upload_files(method: str, fields: dict, files: dict[str, Path]) -> dict:
+    boundary = "----boardbot" + uuid.uuid4().hex
+    body = bytearray()
+
+    for key, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+        body.extend(str(value).encode())
+        body.extend(b"\r\n")
+
+    for field, path in files.items():
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            f'Content-Disposition: form-data; name="{field}"; filename="{path.name}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n".encode()
+        )
+        body.extend(path.read_bytes())
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}--\r\n".encode())
+
+    req = urllib.request.Request(
+        f"{API_BASE}/{method}",
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    logger.info("bot api multipart upload method=%s files=%s", method, len(files))
     with urlopen(req, timeout=UPLOAD_TIMEOUT) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if not payload.get("ok"):
