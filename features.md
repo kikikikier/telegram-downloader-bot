@@ -15,6 +15,7 @@
 - The bot prefers already-combined MP4 files when the source provides them.
 - The preferred video compatibility target is H.264 video with AAC audio.
 - Instagram videos use `gallery-dl` first, then `yt-dlp` as a fallback.
+- Instagram and TikTok image posts use `gallery-dl` first and can return multiple images from one post.
 - YouTube quality options are probed with `yt-dlp --dump-single-json`.
 - YouTube buttons may include `144p`, `240p`, `360p`, `480p`, `720p`, `1080p`, `1440p`, `2160p`.
 

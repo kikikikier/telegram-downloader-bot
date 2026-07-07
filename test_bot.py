@@ -20,6 +20,9 @@ class FakeFile:
     def is_file(self):
         return True
 
+    def exists(self):
+        return True
+
     def stat(self):
         return self._stat
 
@@ -34,11 +37,25 @@ class FakeWorkdir:
     def __truediv__(self, name):
         return Path("fake-workdir") / name
 
+    def mkdir(self, parents=False, exist_ok=False):
+        return None
+
     def iterdir(self):
         return self.files
 
     def rglob(self, pattern):
         return self.files
+
+
+class FakeTmpRoot:
+    def __init__(self, workdir):
+        self.workdir = workdir
+
+    def __truediv__(self, name):
+        return self.workdir
+
+    def mkdir(self, parents=False, exist_ok=False):
+        return None
 
 
 class UrlSupportTests(unittest.TestCase):
@@ -97,6 +114,56 @@ class YtdlpFormatTests(unittest.TestCase):
         self.assertIs(result, expected)
         gallery.assert_called_once()
         ytdlp.assert_not_called()
+
+    def test_download_media_files_routes_tiktok_posts_to_gallery_dl_first(self):
+        expected = [FakeFile("photo.jpg")]
+        workdir = FakeWorkdir(expected)
+
+        with patch.object(bot, "download_with_gallery_dl", create=True, return_value=expected) as gallery:
+            with patch.object(bot, "download_files_with_ytdlp", create=True) as ytdlp:
+                result = bot.download_media_files_for_url(
+                    "https://www.tiktok.com/@user/photo/1234567890",
+                    workdir,
+                    media_mode="video",
+                    quality=None,
+                )
+
+        self.assertEqual(expected, result)
+        gallery.assert_called_once()
+        ytdlp.assert_not_called()
+
+    def test_gallery_dl_image_post_returns_all_downloaded_images(self):
+        workdir = FakeWorkdir([
+            FakeFile("photo-1.jpg", size=1_000_000, mtime=1),
+            FakeFile("photo-2.jpg", size=2_000_000, mtime=2),
+            FakeFile("photo-3.png", size=1_500_000, mtime=3),
+        ])
+
+        with patch.object(bot, "run_logged_command", return_value=(0, "")):
+            paths = bot.download_with_gallery_dl(
+                "https://www.instagram.com/p/ABC123/",
+                workdir,
+            )
+
+        self.assertEqual(["photo-2.jpg", "photo-3.png", "photo-1.jpg"], [path.name for path in paths])
+
+    def test_handle_url_sends_each_downloaded_image_file(self):
+        paths = [
+            FakeFile("photo-1.jpg", size=1_000_000, mtime=1),
+            FakeFile("photo-2.jpg", size=2_000_000, mtime=2),
+        ]
+        workdir = FakeWorkdir(paths)
+
+        with patch.object(bot, "TMP_ROOT", FakeTmpRoot(workdir)):
+            with patch.object(bot, "mark_workdir_active"):
+                with patch.object(bot, "schedule_workdir_cleanup"):
+                    with patch.object(bot, "download_media_files_for_url", create=True, return_value=paths):
+                        with patch.object(bot, "download_media_for_url", return_value=paths[0]):
+                            with patch.object(bot, "send_message"):
+                                with patch.object(bot, "send_media_and_document") as send_media:
+                                    bot.handle_url(123, "https://www.instagram.com/p/ABC123/")
+
+        self.assertEqual([path.name for path in paths], [call.args[1].name for call in send_media.call_args_list])
 
     def test_youtube_options_skip_video_only_formats_without_ffmpeg_merge(self):
         fake_info = {

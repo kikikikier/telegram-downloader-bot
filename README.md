@@ -2,7 +2,7 @@
 
 > Vibe coding note: this project is a full vibe coding artifact: human-directed, AI-assisted, iteratively debugged and shipped.
 
-Telegram bot for downloading public media links and sending the result back as a Telegram media preview plus a raw file/document.
+Telegram bot for downloading public media links, including video and image posts, and sending the result back as a Telegram media preview plus a raw file/document.
 
 Use it only for media you own, are allowed to download, or are otherwise permitted to process.
 
@@ -19,7 +19,8 @@ Use it only for media you own, are allowed to download, or are otherwise permitt
 ## How It Works
 
 - Uses `yt-dlp` for most supported platforms.
-- Uses `gallery-dl` as the first download route for Instagram videos, with `yt-dlp` as a fallback.
+- Uses `gallery-dl` as the first download route for Instagram and TikTok media posts, with `yt-dlp` as a fallback.
+- Sends all downloaded images from image-only gallery/carousel posts.
 - Prefers already-combined MP4 video with H.264/AAC codecs when available.
 - Keeps FFmpeg merging disabled by default to avoid slow server-side video processing.
 - Can use an HTTP/SOCKS proxy for Telegram, yt-dlp, gallery-dl, direct media requests, and MTProto uploads.

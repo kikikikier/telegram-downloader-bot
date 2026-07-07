@@ -83,7 +83,7 @@ logging.basicConfig(
 logger = logging.getLogger("telegram-downloader-bot")
 URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
 DIRECT_MEDIA_RE = re.compile(
-    r"\.(mp4|webm|mov|m4v|jpg|jpeg|png|gif|mp3|m4a|aac|wav|flac|ogg|opus)(?:[?#].*)?$",
+    r"\.(mp4|webm|mov|m4v|jpg|jpeg|png|gif|webp|mp3|m4a|aac|wav|flac|ogg|opus)(?:[?#].*)?$",
     re.IGNORECASE,
 )
 MEDIA_SUFFIXES = {
@@ -95,6 +95,7 @@ MEDIA_SUFFIXES = {
     ".jpeg",
     ".png",
     ".gif",
+    ".webp",
     ".mp3",
     ".m4a",
     ".aac",
@@ -104,6 +105,7 @@ MEDIA_SUFFIXES = {
     ".opus",
 }
 VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".m4v", ".mkv"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
 SUPPORTED_HOST_HINTS = (
     "youtube.com",
@@ -385,6 +387,14 @@ def is_youtube_url(url: str) -> bool:
 
 def is_instagram_url(url: str) -> bool:
     return url_host_matches(url, ("instagram.com", "instagr.am"))
+
+
+def is_tiktok_url(url: str) -> bool:
+    return url_host_matches(url, ("tiktok.com", "tiktokv.com", "vm.tiktok.com", "vt.tiktok.com"))
+
+
+def is_gallery_first_url(url: str) -> bool:
+    return is_instagram_url(url) or is_tiktok_url(url)
 
 
 def send_download_options(chat_id: int, url: str) -> None:
@@ -789,20 +799,26 @@ def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str |
     )
     try:
         send_message(chat_id, pick(ACCEPT_MESSAGES))
-        media_path = download_media_for_url(url, workdir, media_mode=media_mode, quality=quality)
+        media_paths = download_media_files_for_url(url, workdir, media_mode=media_mode, quality=quality)
+        media_paths = [path for path in media_paths if path and path.exists()]
 
-        if not media_path or not media_path.exists():
+        if not media_paths:
             send_message(chat_id, pick(NOT_FOUND_MESSAGES))
             return
 
-        size = media_path.stat().st_size
-        logger.info("download complete file=%s size=%s", media_path.name, human_size(size))
-        send_message(chat_id, pick(DOWNLOADED_MESSAGES))
-        send_media_and_document(chat_id, media_path)
+        total_size = sum(path.stat().st_size for path in media_paths)
         logger.info(
-            "job done chat_id=%s file=%s elapsed=%.1fs",
+            "download complete files=%s size=%s",
+            ", ".join(path.name for path in media_paths),
+            human_size(total_size),
+        )
+        send_message(chat_id, pick(DOWNLOADED_MESSAGES))
+        for media_path in media_paths:
+            send_media_and_document(chat_id, media_path)
+        logger.info(
+            "job done chat_id=%s files=%s elapsed=%.1fs",
             chat_id,
-            media_path.name,
+            len(media_paths),
             time.monotonic() - started_at,
         )
     except subprocess.TimeoutExpired:
@@ -861,7 +877,33 @@ def download_media_for_url(
     return download_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality)
 
 
+def download_media_files_for_url(
+    url: str,
+    workdir: Path,
+    media_mode: str = "video",
+    quality: str | None = "720",
+) -> list[Path]:
+    if DIRECT_MEDIA_RE.search(url):
+        return [download_direct(url, workdir)]
+
+    if is_gallery_first_url(url) and media_mode == "video":
+        try:
+            return download_with_gallery_dl(url, workdir)
+        except Exception as exc:
+            logger.exception(
+                "gallery-dl failed, falling back to yt-dlp url=%s error=%s",
+                safe_log_url(url),
+                short_error(exc),
+            )
+
+    return download_files_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality)
+
+
 def download_instagram_with_gallery_dl(url: str, workdir: Path) -> Path:
+    return download_with_gallery_dl(url, workdir)[0]
+
+
+def download_with_gallery_dl(url: str, workdir: Path) -> list[Path]:
     gallery_args = [
         "--config-ignore",
         "--no-part",
@@ -884,7 +926,7 @@ def download_instagram_with_gallery_dl(url: str, workdir: Path) -> Path:
     if returncode != 0:
         raise RuntimeError(output or "gallery-dl failed")
 
-    return select_downloaded_media_file(workdir)
+    return select_downloaded_media_files(workdir)
 
 
 def download_with_ytdlp(
@@ -893,6 +935,15 @@ def download_with_ytdlp(
     media_mode: str = "video",
     quality: str | None = "720",
 ) -> Path:
+    return download_files_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality)[0]
+
+
+def download_files_with_ytdlp(
+    url: str,
+    workdir: Path,
+    media_mode: str = "video",
+    quality: str | None = "720",
+) -> list[Path]:
     output_template = str(workdir / "%(title).80s-%(id)s.%(ext)s")
 
     if media_mode == "audio":
@@ -953,10 +1004,14 @@ def download_with_ytdlp(
                 f"Выбранный файл больше защитного лимита скачивания {DOWNLOAD_MAX_MB} MB."
             )
         raise RuntimeError(output or "yt-dlp did not create a media file")
-    return select_preferred_media_file(files)
+    return select_preferred_media_files(files)
 
 
 def select_downloaded_media_file(workdir: Path) -> Path:
+    return select_downloaded_media_files(workdir)[0]
+
+
+def select_downloaded_media_files(workdir: Path) -> list[Path]:
     files = [
         path for path in workdir.rglob("*")
         if path.is_file()
@@ -965,14 +1020,20 @@ def select_downloaded_media_file(workdir: Path) -> Path:
     ]
     if not files:
         raise RuntimeError("downloader did not create a media file")
-    return select_preferred_media_file(files)
+    return select_preferred_media_files(files)
 
 
 def select_preferred_media_file(files: list[Path]) -> Path:
+    return select_preferred_media_files(files)[0]
+
+
+def select_preferred_media_files(files: list[Path]) -> list[Path]:
     video_files = [path for path in files if path.suffix.lower() in VIDEO_SUFFIXES]
-    candidates = video_files or files
+    candidates = video_files or [path for path in files if path.suffix.lower() in IMAGE_SUFFIXES] or files
     candidates.sort(key=lambda path: (path.stat().st_size, path.stat().st_mtime), reverse=True)
-    return candidates[0]
+    if video_files:
+        return [candidates[0]]
+    return candidates
 
 
 def build_ytdlp_command(args: list[str]) -> list[str]:
