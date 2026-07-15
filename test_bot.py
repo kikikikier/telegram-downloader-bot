@@ -304,7 +304,8 @@ class YtdlpFormatTests(unittest.TestCase):
         }
 
         with patch.object(bot, "probe_ytdlp_info", return_value=fake_info):
-            options, _ = bot.get_youtube_download_options("https://www.youtube.com/watch?v=videoid")
+            with patch.object(bot, "video_ffmpeg_merge_enabled", return_value=False):
+                options, _ = bot.get_youtube_download_options("https://www.youtube.com/watch?v=videoid")
 
         self.assertEqual([{"height": 720, "estimated_bytes": 5_000_000}], options)
 
@@ -316,7 +317,7 @@ class YtdlpFormatTests(unittest.TestCase):
             captured["on_output_line"] = on_output_line
             return 0, ""
 
-        with patch.object(bot.shutil, "which", return_value="/usr/bin/ffmpeg"):
+        with patch.object(bot, "video_ffmpeg_merge_enabled", return_value=False):
             with patch.object(bot, "run_logged_command", side_effect=fake_run_logged_command):
                 bot.download_with_ytdlp(
                     "https://www.youtube.com/watch?v=videoid",
@@ -330,6 +331,56 @@ class YtdlpFormatTests(unittest.TestCase):
         selector = cmd[cmd.index("-f") + 1]
         self.assertIn("b[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]", selector)
         self.assertNotIn("+ba", selector)
+
+    def test_video_download_merge_selector_prefers_requested_4k_before_progressive_fallback(self):
+        selector = bot.video_format_selector("2160", allow_merge=True)
+        choices = selector.split("/")
+
+        self.assertIn("+ba", choices[0])
+        self.assertIn("[height=2160]", choices[0])
+        self.assertGreater(
+            choices.index("b[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=2160]"),
+            0,
+        )
+
+    def test_youtube_options_include_video_only_4k_when_ffmpeg_merge_enabled(self):
+        fake_info = {
+            "duration": None,
+            "formats": [
+                {
+                    "height": 360,
+                    "ext": "mp4",
+                    "vcodec": "avc1.42001E",
+                    "acodec": "mp4a.40.2",
+                    "filesize": 25_000_000,
+                },
+                {
+                    "height": 2160,
+                    "ext": "mp4",
+                    "vcodec": "av01.0.12M.08",
+                    "acodec": "none",
+                    "filesize": 350_000_000,
+                },
+                {
+                    "ext": "m4a",
+                    "vcodec": "none",
+                    "acodec": "mp4a.40.2",
+                    "filesize": 8_000_000,
+                },
+            ],
+        }
+
+        with patch.object(bot, "probe_ytdlp_info", return_value=fake_info):
+            with patch.object(bot, "video_ffmpeg_merge_enabled", return_value=True):
+                options, _ = bot.get_youtube_download_options("https://www.youtube.com/watch?v=videoid")
+
+        self.assertEqual(
+            [
+                {"height": 360, "estimated_bytes": 25_000_000},
+                {"height": 2160, "estimated_bytes": 358_000_000},
+            ],
+            options,
+        )
 
     def test_ytdlp_download_updates_progress_from_output_lines(self):
         edits = []

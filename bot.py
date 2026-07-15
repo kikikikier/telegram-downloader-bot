@@ -61,7 +61,7 @@ DOWNLOAD_MAX_BYTES = DOWNLOAD_MAX_MB * 1024 * 1024 if DOWNLOAD_MAX_MB else None
 DOWNLOAD_TIMEOUT = int(os.environ.get("BOT_DOWNLOAD_TIMEOUT", "900"))
 PROBE_TIMEOUT = int(os.environ.get("BOT_PROBE_TIMEOUT", "90"))
 AUDIO_BITRATE = os.environ.get("BOT_AUDIO_BITRATE", "96K").strip() or "96K"
-BOT_ENABLE_FFMPEG_MERGE = env_bool("BOT_ENABLE_FFMPEG_MERGE", False)
+BOT_ENABLE_FFMPEG_MERGE = env_bool("BOT_ENABLE_FFMPEG_MERGE", True)
 PROGRESS_MIN_INTERVAL_SECONDS = float(os.environ.get("BOT_PROGRESS_MIN_INTERVAL_SECONDS", "3"))
 PROGRESS_BAR_WIDTH = 12
 TMP_ROOT = Path(os.environ.get("BOT_TMP_DIR", tempfile.gettempdir())) / "telegram-downloader-bot"
@@ -595,6 +595,10 @@ def height_filter(max_height: int | None) -> str:
     return f"[height<={max_height}]" if max_height else ""
 
 
+def exact_height_filter(height: int | None) -> str:
+    return f"[height={height}]" if height else ""
+
+
 def progressive_mp4_selectors(max_height: int | None) -> list[str]:
     height = height_filter(max_height)
     return [
@@ -609,19 +613,30 @@ def progressive_mp4_selectors(max_height: int | None) -> list[str]:
 
 def merged_mp4_selectors(max_height: int | None) -> list[str]:
     height = height_filter(max_height)
-    return [
+    selectors = []
+    if max_height:
+        exact_height = exact_height_filter(max_height)
+        selectors.extend([
+            f"bv*[ext=mp4]{exact_height}+ba[ext=m4a]",
+            f"bv*{exact_height}+ba[ext=m4a]",
+            f"bv*{exact_height}+ba",
+        ])
+    selectors.extend([
+        f"bv*[ext=mp4]{height}+ba[ext=m4a]",
+        f"bv*{height}+ba[ext=m4a]",
+        f"bv*{height}+ba",
         f"bv*[ext=mp4][vcodec^=avc1]{height}+ba[ext=m4a]",
         f"bv*[ext=mp4][vcodec*=h264]{height}+ba[ext=m4a]",
-        f"bv*[ext=mp4]{height}+ba[ext=m4a]",
-        f"bv*{height}+ba",
-    ]
+    ])
+    return selectors
 
 
 def video_format_selector(quality: str | None, allow_merge: bool = False) -> str:
     max_height = quality_max_height(quality)
-    selectors = progressive_mp4_selectors(max_height)
     if allow_merge:
-        selectors.extend(merged_mp4_selectors(max_height))
+        selectors = merged_mp4_selectors(max_height) + progressive_mp4_selectors(max_height)
+    else:
+        selectors = progressive_mp4_selectors(max_height)
     fallback = f"best{height_filter(max_height)}/best" if max_height else "best"
     selectors.append(fallback)
     return "/".join(selectors)
@@ -1135,7 +1150,7 @@ def download_files_with_ytdlp(
         if quality != "best" and not str(quality).isdigit():
             quality = "best"
 
-        allow_merge = video_ffmpeg_merge_enabled()
+        allow_merge = is_youtube_url(url) and video_ffmpeg_merge_enabled()
         format_selector = video_format_selector(quality, allow_merge=allow_merge)
         merge_args = ["--merge-output-format", "mp4"] if allow_merge else []
         media_args = [*merge_args, "-f", format_selector]
