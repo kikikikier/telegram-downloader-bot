@@ -311,8 +311,9 @@ class YtdlpFormatTests(unittest.TestCase):
     def test_video_download_prefers_progressive_h264_mp4_without_ffmpeg_merge(self):
         captured = {}
 
-        def fake_run_logged_command(cmd, cwd=None, timeout=None, label="cmd"):
+        def fake_run_logged_command(cmd, cwd=None, timeout=None, label="cmd", on_output_line=None):
             captured["cmd"] = cmd
+            captured["on_output_line"] = on_output_line
             return 0, ""
 
         with patch.object(bot.shutil, "which", return_value="/usr/bin/ffmpeg"):
@@ -329,6 +330,54 @@ class YtdlpFormatTests(unittest.TestCase):
         selector = cmd[cmd.index("-f") + 1]
         self.assertIn("b[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]", selector)
         self.assertNotIn("+ba", selector)
+
+    def test_ytdlp_download_updates_progress_from_output_lines(self):
+        edits = []
+        progress = bot.DownloadProgressReporter(
+            123,
+            456,
+            min_interval=0,
+            edit_func=lambda chat_id, message_id, text: edits.append((chat_id, message_id, text)),
+        )
+
+        def fake_run_logged_command(cmd, cwd=None, timeout=None, label="cmd", on_output_line=None):
+            self.assertIsNotNone(on_output_line)
+            on_output_line("[download]  36.6% of    5.46MiB at    6.50MiB/s ETA 00:00")
+            return 0, ""
+
+        with patch.object(bot, "run_logged_command", side_effect=fake_run_logged_command):
+            bot.download_files_with_ytdlp(
+                "https://www.youtube.com/watch?v=videoid",
+                FakeWorkdir([FakeFile("download.mp4")]),
+                media_mode="video",
+                quality="720",
+                progress=progress,
+            )
+
+        self.assertEqual(123, edits[-1][0])
+        self.assertEqual(456, edits[-1][1])
+        self.assertIn("37%", edits[-1][2])
+
+    def test_ffmpeg_progress_line_updates_progress_by_duration(self):
+        edits = []
+        progress = bot.DownloadProgressReporter(
+            123,
+            456,
+            min_interval=0,
+            edit_func=lambda chat_id, message_id, text: edits.append(text),
+        )
+
+        progress.handle_ffmpeg_line("out_time=00:00:05.000000", duration=10)
+
+        self.assertIn("50%", edits[-1])
+
+    def test_send_message_returns_bot_api_payload(self):
+        payload = {"ok": True, "result": {"message_id": 456}}
+
+        with patch.object(bot, "api_json", return_value=payload):
+            result = bot.send_message(123, "hello")
+
+        self.assertIs(result, payload)
 
 
 class UserReplicaTests(unittest.TestCase):

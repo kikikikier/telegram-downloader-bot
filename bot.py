@@ -62,6 +62,8 @@ DOWNLOAD_TIMEOUT = int(os.environ.get("BOT_DOWNLOAD_TIMEOUT", "900"))
 PROBE_TIMEOUT = int(os.environ.get("BOT_PROBE_TIMEOUT", "90"))
 AUDIO_BITRATE = os.environ.get("BOT_AUDIO_BITRATE", "96K").strip() or "96K"
 BOT_ENABLE_FFMPEG_MERGE = env_bool("BOT_ENABLE_FFMPEG_MERGE", False)
+PROGRESS_MIN_INTERVAL_SECONDS = float(os.environ.get("BOT_PROGRESS_MIN_INTERVAL_SECONDS", "3"))
+PROGRESS_BAR_WIDTH = 12
 TMP_ROOT = Path(os.environ.get("BOT_TMP_DIR", tempfile.gettempdir())) / "telegram-downloader-bot"
 CLEANUP_DELAY_SECONDS = int(os.environ.get("BOT_CLEANUP_DELAY_SECONDS", "60"))
 CLEANUP_SWEEP_SECONDS = int(os.environ.get("BOT_CLEANUP_SWEEP_SECONDS", "30"))
@@ -82,6 +84,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("telegram-downloader-bot")
 URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
+YTDLP_PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+FFMPEG_OUT_TIME_RE = re.compile(r"out_time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 DIRECT_MEDIA_RE = re.compile(
     r"\.(mp4|webm|mov|m4v|jpg|jpeg|png|gif|webp|mp3|m4a|aac|wav|flac|ogg|opus)(?:[?#].*)?$",
     re.IGNORECASE,
@@ -652,6 +656,114 @@ def pick(messages: tuple[str, ...]) -> str:
     return random.choice(messages)
 
 
+def clamp_percent(percent: float) -> float:
+    return max(0.0, min(100.0, percent))
+
+
+def progress_bar(percent: float, width: int = PROGRESS_BAR_WIDTH) -> str:
+    percent = clamp_percent(percent)
+    filled = int(round(width * percent / 100))
+    return "[" + "#" * filled + "-" * (width - filled) + f"] {percent:.0f}%"
+
+
+def progress_text(label: str, percent: float) -> str:
+    return f"{label}\n{progress_bar(percent)}"
+
+
+def parse_ytdlp_progress_percent(line: str) -> float | None:
+    match = YTDLP_PROGRESS_RE.search(line)
+    if not match:
+        return None
+    return clamp_percent(float(match.group(1)))
+
+
+def parse_ffmpeg_out_time_percent(line: str, duration: float | None) -> float | None:
+    if not duration or duration <= 0:
+        return None
+    if line.strip() == "progress=end":
+        return 100.0
+    match = FFMPEG_OUT_TIME_RE.search(line)
+    if not match:
+        return None
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    seconds = float(match.group(3))
+    elapsed = hours * 3600 + minutes * 60 + seconds
+    return clamp_percent(elapsed * 100 / duration)
+
+
+class DownloadProgressReporter:
+    def __init__(
+        self,
+        chat_id: int,
+        message_id: int,
+        label: str = "Скачиваю",
+        min_interval: float | None = None,
+        clock=None,
+        edit_func=None,
+    ):
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.label = label
+        self.min_interval = PROGRESS_MIN_INTERVAL_SECONDS if min_interval is None else min_interval
+        self.clock = clock or time.monotonic
+        self.edit_func = edit_func
+        self.last_update_at = -self.min_interval
+        self.last_rounded: int | None = None
+
+    def update(self, percent: float, label: str | None = None, force: bool = False) -> None:
+        percent = clamp_percent(percent)
+        rounded = int(round(percent))
+        now = self.clock()
+        if not force and rounded == self.last_rounded:
+            return
+        if not force and percent < 100 and now - self.last_update_at < self.min_interval:
+            return
+
+        text = progress_text(label or self.label, percent)
+        try:
+            edit = self.edit_func or edit_message_text
+            edit(self.chat_id, self.message_id, text)
+            self.last_update_at = now
+            self.last_rounded = rounded
+        except Exception as exc:
+            logger.warning("progress update failed: %s", short_error(exc))
+
+    def update_bytes(self, written: int, total: int | None) -> None:
+        if total and total > 0:
+            self.update(written * 100 / total)
+
+    def handle_ytdlp_line(self, line: str) -> None:
+        percent = parse_ytdlp_progress_percent(line)
+        if percent is not None:
+            self.update(percent, label="Скачиваю")
+
+    def handle_ffmpeg_line(self, line: str, duration: float | None) -> None:
+        percent = parse_ffmpeg_out_time_percent(line, duration)
+        if percent is not None:
+            self.update(percent, label="Готовлю файл")
+
+    def finish(self) -> None:
+        self.update(100, label="Готово", force=True)
+
+    def fail(self) -> None:
+        self.update(100, label="Не получилось", force=True)
+
+
+def start_progress_message(chat_id: int, label: str = "Скачиваю") -> DownloadProgressReporter | None:
+    try:
+        payload = send_message(chat_id, progress_text(label, 0))
+    except Exception as exc:
+        logger.warning("could not start progress message: %s", short_error(exc))
+        return None
+    if not isinstance(payload, dict):
+        return None
+    message_id = payload.get("result", {}).get("message_id")
+    if not isinstance(message_id, int):
+        return None
+    return DownloadProgressReporter(chat_id, message_id, label=label)
+
+
 def part_caption(index: int, total: int) -> str:
     return f"Кусочек {index}/{total}. Благодать нарезана аккуратно."
 
@@ -798,6 +910,7 @@ def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str |
     workdir.mkdir(parents=True, exist_ok=True)
     mark_workdir_active(workdir)
     started_at = time.monotonic()
+    progress = None
     logger.info(
         "job start chat_id=%s mode=%s quality=%s url=%s workdir=%s",
         chat_id,
@@ -808,10 +921,19 @@ def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str |
     )
     try:
         send_message(chat_id, pick(ACCEPT_MESSAGES))
-        media_paths = download_media_files_for_url(url, workdir, media_mode=media_mode, quality=quality)
+        progress = start_progress_message(chat_id)
+        media_paths = download_media_files_for_url(
+            url,
+            workdir,
+            media_mode=media_mode,
+            quality=quality,
+            progress=progress,
+        )
         media_paths = [path for path in media_paths if path and path.exists()]
 
         if not media_paths:
+            if progress:
+                progress.fail()
             send_message(chat_id, pick(NOT_FOUND_MESSAGES))
             return
 
@@ -821,12 +943,17 @@ def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str |
             ", ".join(path.name for path in media_paths),
             human_size(total_size),
         )
+        if progress:
+            progress.finish()
         send_message(chat_id, pick(DOWNLOADED_MESSAGES))
         if is_image_gallery(media_paths):
             send_image_gallery(chat_id, media_paths)
         else:
             for media_path in media_paths:
-                send_media_and_document(chat_id, media_path)
+                if progress:
+                    send_media_and_document(chat_id, media_path, progress=progress)
+                else:
+                    send_media_and_document(chat_id, media_path)
         logger.info(
             "job done chat_id=%s files=%s elapsed=%.1fs",
             chat_id,
@@ -835,15 +962,19 @@ def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str |
         )
     except subprocess.TimeoutExpired:
         logger.exception("job timeout chat_id=%s url=%s", chat_id, safe_log_url(url))
+        if progress:
+            progress.fail()
         send_message(chat_id, pick(TIMEOUT_MESSAGES))
     except Exception as exc:
         logger.exception("job failed chat_id=%s url=%s error=%s", chat_id, safe_log_url(url), short_error(exc))
+        if progress:
+            progress.fail()
         send_message(chat_id, pick(ERROR_MESSAGES))
     finally:
         schedule_workdir_cleanup(workdir)
 
 
-def download_direct(url: str, workdir: Path) -> Path:
+def download_direct(url: str, workdir: Path, progress: DownloadProgressReporter | None = None) -> Path:
     parsed = urllib.parse.urlparse(url)
     name = Path(urllib.parse.unquote(parsed.path)).name or "media"
     path = safe_target(workdir, name)
@@ -851,9 +982,12 @@ def download_direct(url: str, workdir: Path) -> Path:
     logger.info("direct download start url=%s target=%s", safe_log_url(url), path.name)
     with media_urlopen(req, timeout=DOWNLOAD_TIMEOUT) as response:
         length = response.headers.get("content-length")
-        if DOWNLOAD_MAX_BYTES and length and int(length) > DOWNLOAD_MAX_BYTES:
-            raise RuntimeError(f"remote file is {human_size(int(length))}, over download limit {DOWNLOAD_MAX_MB} MB")
+        total = int(length) if length and length.isdigit() else None
+        if DOWNLOAD_MAX_BYTES and total and total > DOWNLOAD_MAX_BYTES:
+            raise RuntimeError(f"remote file is {human_size(total)}, over download limit {DOWNLOAD_MAX_MB} MB")
         written = 0
+        if progress:
+            progress.update_bytes(written, total)
         with path.open("wb") as out:
             while True:
                 chunk = response.read(1024 * 256)
@@ -863,6 +997,10 @@ def download_direct(url: str, workdir: Path) -> Path:
                 if DOWNLOAD_MAX_BYTES and written > DOWNLOAD_MAX_BYTES:
                     raise RuntimeError(f"file grew over download limit {DOWNLOAD_MAX_MB} MB")
                 out.write(chunk)
+                if progress:
+                    progress.update_bytes(written, total)
+    if progress:
+        progress.update(100, force=True)
     logger.info("direct download complete file=%s size=%s", path.name, human_size(path.stat().st_size))
     return path
 
@@ -872,9 +1010,10 @@ def download_media_for_url(
     workdir: Path,
     media_mode: str = "video",
     quality: str | None = "720",
+    progress: DownloadProgressReporter | None = None,
 ) -> Path:
     if DIRECT_MEDIA_RE.search(url):
-        return download_direct(url, workdir)
+        return download_direct(url, workdir, progress=progress)
 
     if is_instagram_url(url) and not is_instagram_reel_url(url) and media_mode == "video":
         try:
@@ -886,6 +1025,8 @@ def download_media_for_url(
                 short_error(exc),
             )
 
+    if progress:
+        return download_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality, progress=progress)
     return download_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality)
 
 
@@ -894,9 +1035,10 @@ def download_media_files_for_url(
     workdir: Path,
     media_mode: str = "video",
     quality: str | None = "720",
+    progress: DownloadProgressReporter | None = None,
 ) -> list[Path]:
     if DIRECT_MEDIA_RE.search(url):
-        return [download_direct(url, workdir)]
+        return [download_direct(url, workdir, progress=progress)]
 
     if is_gallery_first_url(url) and media_mode == "video":
         try:
@@ -916,6 +1058,8 @@ def download_media_files_for_url(
                 short_error(exc),
             )
 
+    if progress:
+        return download_files_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality, progress=progress)
     return download_files_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality)
 
 
@@ -957,7 +1101,10 @@ def download_with_ytdlp(
     workdir: Path,
     media_mode: str = "video",
     quality: str | None = "720",
+    progress: DownloadProgressReporter | None = None,
 ) -> Path:
+    if progress:
+        return download_files_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality, progress=progress)[0]
     return download_files_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality)[0]
 
 
@@ -966,6 +1113,7 @@ def download_files_with_ytdlp(
     workdir: Path,
     media_mode: str = "video",
     quality: str | None = "720",
+    progress: DownloadProgressReporter | None = None,
 ) -> list[Path]:
     output_template = str(workdir / "%(title).80s-%(id)s.%(ext)s")
 
@@ -995,6 +1143,7 @@ def download_files_with_ytdlp(
     ytdlp_args = [
         "--no-playlist",
         "--newline",
+        "--no-colors",
         "--windows-filenames",
         "--restrict-filenames",
         *media_args,
@@ -1006,12 +1155,14 @@ def download_files_with_ytdlp(
         ytdlp_args[1:1] = ["--max-filesize", f"{DOWNLOAD_MAX_MB}M"]
     cmd = build_ytdlp_command(ytdlp_args, url=url)
 
-    returncode, output = run_logged_command(
-        cmd,
-        cwd=workdir,
-        timeout=DOWNLOAD_TIMEOUT,
-        label="yt-dlp",
-    )
+    run_kwargs = {
+        "cwd": workdir,
+        "timeout": DOWNLOAD_TIMEOUT,
+        "label": "yt-dlp",
+    }
+    if progress:
+        run_kwargs["on_output_line"] = progress.handle_ytdlp_line
+    returncode, output = run_logged_command(cmd, **run_kwargs)
     if returncode != 0:
         raise RuntimeError(output or "yt-dlp failed")
 
@@ -1111,6 +1262,7 @@ def run_logged_command(
     cwd: Path | None = None,
     timeout: int | None = None,
     label: str = "cmd",
+    on_output_line=None,
 ) -> tuple[int, str]:
     logger.info("%s start: %s", label, redacted_command(cmd))
     started_at = time.monotonic()
@@ -1133,6 +1285,11 @@ def run_logged_command(
             line = redact_secret_text(line)
             output_tail.append(line)
             logger.info("%s | %s", label, line)
+            if on_output_line:
+                try:
+                    on_output_line(line)
+                except Exception as exc:
+                    logger.warning("%s progress callback failed: %s", label, short_error(exc))
 
     reader = threading.Thread(target=read_output, daemon=True)
     reader.start()
@@ -1199,7 +1356,7 @@ def safe_target(workdir: Path, name: str) -> Path:
     return workdir / clean[:120]
 
 
-def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> None:
+def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> dict:
     params = {
         "chat_id": chat_id,
         "text": text[:3900],
@@ -1207,7 +1364,7 @@ def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> N
     }
     if reply_markup:
         params["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-    api_json("sendMessage", params)
+    return api_json("sendMessage", params)
 
 
 def edit_message_text(chat_id: int, message_id: int, text: str) -> None:
@@ -1241,7 +1398,7 @@ def send_document(chat_id: int, path: Path, caption: str = "") -> None:
     upload_file("sendDocument", fields, "document", path, mime_override="application/octet-stream")
 
 
-def send_media_and_document(chat_id: int, path: Path) -> None:
+def send_media_and_document(chat_id: int, path: Path, progress: DownloadProgressReporter | None = None) -> None:
     size = path.stat().st_size
     logger.info(
         "upload route file=%s size=%s limit=%s local_bot_api=%s mtproto=%s",
@@ -1270,7 +1427,7 @@ def send_media_and_document(chat_id: int, path: Path) -> None:
             human_size(size),
             human_size(MTPROTO_MAX_BYTES),
         )
-    send_large_media_parts(chat_id, path)
+    send_large_media_parts(chat_id, path, progress=progress)
 
 
 def is_image_gallery(paths: list[Path]) -> bool:
@@ -1350,9 +1507,9 @@ def send_small_media_and_document(chat_id: int, path: Path, caption_prefix: str 
         send_document(chat_id, path, caption=caption)
 
 
-def send_large_media_parts(chat_id: int, path: Path) -> None:
+def send_large_media_parts(chat_id: int, path: Path, progress: DownloadProgressReporter | None = None) -> None:
     send_message(chat_id, pick(SPLIT_MESSAGES))
-    segments = split_media_with_ffmpeg(path)
+    segments = split_media_with_ffmpeg(path, progress=progress)
     if not segments:
         raise RuntimeError("ffmpeg did not create segments")
 
@@ -1361,7 +1518,7 @@ def send_large_media_parts(chat_id: int, path: Path) -> None:
         send_small_media_and_document(chat_id, segment, caption_prefix=part_caption(index, total))
 
 
-def split_media_with_ffmpeg(path: Path) -> list[Path]:
+def split_media_with_ffmpeg(path: Path, progress: DownloadProgressReporter | None = None) -> list[Path]:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg is not installed")
 
@@ -1379,11 +1536,16 @@ def split_media_with_ffmpeg(path: Path) -> list[Path]:
     for _attempt in range(6):
         cleanup_existing_segments(path.parent, path.stem, suffix)
         logger.info("ffmpeg split attempt segment_time=%ss target_part=%s", segment_time, human_size(PART_BYTES))
+        if progress:
+            progress.update(0, label="Готовлю файл", force=True)
         cmd = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
             os.environ.get("BOT_FFMPEG_LOGLEVEL", "error"),
+            "-nostats",
+            "-progress",
+            "pipe:1",
             "-y",
             "-i",
             str(path),
@@ -1399,11 +1561,15 @@ def split_media_with_ffmpeg(path: Path) -> list[Path]:
             "1",
             str(pattern),
         ]
-        returncode, output = run_logged_command(
-            cmd,
-            timeout=max(DOWNLOAD_TIMEOUT, 600),
-            label="ffmpeg-split",
-        )
+        run_kwargs = {
+            "timeout": max(DOWNLOAD_TIMEOUT, 600),
+            "label": "ffmpeg-split",
+        }
+        if progress:
+            run_kwargs["on_output_line"] = (
+                lambda line, media_duration=duration: progress.handle_ffmpeg_line(line, media_duration)
+            )
+        returncode, output = run_logged_command(cmd, **run_kwargs)
         if returncode != 0:
             last_error = output
             break
@@ -1415,6 +1581,8 @@ def split_media_with_ffmpeg(path: Path) -> list[Path]:
             ", ".join(f"{segment.name}={human_size(segment.stat().st_size)}" for segment in segments[:8]),
         )
         if segments and all(segment.stat().st_size <= MAX_BYTES for segment in segments):
+            if progress:
+                progress.update(100, label="Файл подготовлен", force=True)
             return segments
         segment_time = max(3, int(segment_time * 0.65))
 
