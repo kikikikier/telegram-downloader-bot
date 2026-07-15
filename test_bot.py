@@ -98,12 +98,12 @@ class YtdlpFormatTests(unittest.TestCase):
         self.assertNotIn("yt_dlp", captured["cmd"])
         self.assertNotIn("--merge-output-format", captured["cmd"])
 
-    def test_download_media_routes_instagram_video_to_gallery_dl(self):
+    def test_download_media_routes_instagram_reels_to_ytdlp_first(self):
         expected = FakeFile("reel.mp4")
         workdir = FakeWorkdir([expected])
 
-        with patch.object(bot, "download_instagram_with_gallery_dl", create=True, return_value=expected) as gallery:
-            with patch.object(bot, "download_with_ytdlp") as ytdlp:
+        with patch.object(bot, "download_instagram_with_gallery_dl", create=True) as gallery:
+            with patch.object(bot, "download_with_ytdlp", create=True, return_value=expected) as ytdlp:
                 result = bot.download_media_for_url(
                     "https://www.instagram.com/reel/ABC123/",
                     workdir,
@@ -112,8 +112,13 @@ class YtdlpFormatTests(unittest.TestCase):
                 )
 
         self.assertIs(result, expected)
-        gallery.assert_called_once()
-        ytdlp.assert_not_called()
+        gallery.assert_not_called()
+        ytdlp.assert_called_once_with(
+            "https://www.instagram.com/reel/ABC123/",
+            workdir,
+            media_mode="video",
+            quality=None,
+        )
 
     def test_download_media_files_routes_tiktok_posts_to_gallery_dl_first(self):
         expected = [FakeFile("photo.jpg")]
@@ -131,6 +136,78 @@ class YtdlpFormatTests(unittest.TestCase):
         self.assertEqual(expected, result)
         gallery.assert_called_once()
         ytdlp.assert_not_called()
+
+    def test_download_media_files_routes_instagram_reels_to_ytdlp_first(self):
+        expected = [FakeFile("reel.mp4")]
+        workdir = FakeWorkdir(expected)
+
+        with patch.object(bot, "download_with_gallery_dl", create=True) as gallery:
+            with patch.object(bot, "download_files_with_ytdlp", create=True, return_value=expected) as ytdlp:
+                result = bot.download_media_files_for_url(
+                    "https://www.instagram.com/reel/ABC123/",
+                    workdir,
+                    media_mode="video",
+                    quality=None,
+                )
+
+        self.assertEqual(expected, result)
+        gallery.assert_not_called()
+        ytdlp.assert_called_once_with(
+            "https://www.instagram.com/reel/ABC123/",
+            workdir,
+            media_mode="video",
+            quality=None,
+        )
+
+    def test_gallery_dl_reel_image_only_is_not_accepted_as_video(self):
+        workdir = FakeWorkdir([FakeFile("preview.jpg")])
+
+        with patch.object(bot, "run_logged_command", return_value=(0, "")):
+            with self.assertRaisesRegex(RuntimeError, "no video"):
+                bot.download_instagram_with_gallery_dl(
+                    "https://www.instagram.com/reel/ABC123/",
+                    workdir,
+                )
+
+    def test_instagram_image_post_keeps_gallery_images_without_ytdlp_fallback(self):
+        expected = [
+            FakeFile("photo-1.jpg", size=1_000_000, mtime=1),
+            FakeFile("photo-2.jpg", size=2_000_000, mtime=2),
+        ]
+        workdir = FakeWorkdir(expected)
+
+        with patch.object(bot, "download_with_gallery_dl", create=True, return_value=expected) as gallery:
+            with patch.object(bot, "download_files_with_ytdlp", create=True) as ytdlp:
+                result = bot.download_media_files_for_url(
+                    "https://www.instagram.com/p/ABC123/",
+                    workdir,
+                    media_mode="video",
+                    quality=None,
+                )
+
+        self.assertEqual(expected, result)
+        gallery.assert_called_once()
+        ytdlp.assert_not_called()
+
+    def test_instagram_ytdlp_download_uses_instagram_cookies_file(self):
+        captured = {}
+        workdir = FakeWorkdir([FakeFile("reel.mp4")])
+
+        def fake_run_logged_command(cmd, cwd=None, timeout=None, label="cmd"):
+            captured["cmd"] = cmd
+            return 0, ""
+
+        with patch.dict(bot.os.environ, {"BOT_INSTAGRAM_COOKIES_FILE": "instagram-cookies.txt"}, clear=True):
+            with patch.object(bot, "run_logged_command", side_effect=fake_run_logged_command):
+                bot.download_files_with_ytdlp(
+                    "https://www.instagram.com/reel/ABC123/",
+                    workdir,
+                    media_mode="video",
+                    quality=None,
+                )
+
+        self.assertIn("--cookies", captured["cmd"])
+        self.assertIn("instagram-cookies.txt", captured["cmd"])
 
     def test_gallery_dl_image_post_returns_all_downloaded_images(self):
         workdir = FakeWorkdir([

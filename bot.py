@@ -391,12 +391,19 @@ def is_instagram_url(url: str) -> bool:
     return url_host_matches(url, ("instagram.com", "instagr.am"))
 
 
+def is_instagram_reel_url(url: str) -> bool:
+    if not is_instagram_url(url):
+        return False
+    path = urllib.parse.urlparse(url).path.lower()
+    return "/reel/" in path or "/reels/" in path
+
+
 def is_tiktok_url(url: str) -> bool:
     return url_host_matches(url, ("tiktok.com", "tiktokv.com", "vm.tiktok.com", "vt.tiktok.com"))
 
 
 def is_gallery_first_url(url: str) -> bool:
-    return is_instagram_url(url) or is_tiktok_url(url)
+    return (is_instagram_url(url) and not is_instagram_reel_url(url)) or is_tiktok_url(url)
 
 
 def send_download_options(chat_id: int, url: str) -> None:
@@ -515,7 +522,7 @@ def probe_ytdlp_info(url: str) -> dict:
         "--dump-single-json",
         "--no-warnings",
         url,
-    ])
+    ], url=url)
     result = subprocess.run(
         cmd,
         text=True,
@@ -869,7 +876,7 @@ def download_media_for_url(
     if DIRECT_MEDIA_RE.search(url):
         return download_direct(url, workdir)
 
-    if is_instagram_url(url) and media_mode == "video":
+    if is_instagram_url(url) and not is_instagram_reel_url(url) and media_mode == "video":
         try:
             return download_instagram_with_gallery_dl(url, workdir)
         except Exception as exc:
@@ -893,7 +900,15 @@ def download_media_files_for_url(
 
     if is_gallery_first_url(url) and media_mode == "video":
         try:
-            return download_with_gallery_dl(url, workdir)
+            gallery_files = download_with_gallery_dl(url, workdir)
+            if should_retry_gallery_result_with_ytdlp(url, media_mode, gallery_files):
+                logger.warning(
+                    "gallery-dl returned no video for instagram reel, falling back to yt-dlp url=%s files=%s",
+                    safe_log_url(url),
+                    ", ".join(path.name for path in gallery_files),
+                )
+            else:
+                return gallery_files
         except Exception as exc:
             logger.exception(
                 "gallery-dl failed, falling back to yt-dlp url=%s error=%s",
@@ -905,7 +920,10 @@ def download_media_files_for_url(
 
 
 def download_instagram_with_gallery_dl(url: str, workdir: Path) -> Path:
-    return download_with_gallery_dl(url, workdir)[0]
+    files = download_with_gallery_dl(url, workdir)
+    if should_retry_gallery_result_with_ytdlp(url, "video", files):
+        raise RuntimeError("gallery-dl returned no video for instagram reel")
+    return files[0]
 
 
 def download_with_gallery_dl(url: str, workdir: Path) -> list[Path]:
@@ -986,7 +1004,7 @@ def download_files_with_ytdlp(
     ]
     if DOWNLOAD_MAX_MB:
         ytdlp_args[1:1] = ["--max-filesize", f"{DOWNLOAD_MAX_MB}M"]
-    cmd = build_ytdlp_command(ytdlp_args)
+    cmd = build_ytdlp_command(ytdlp_args, url=url)
 
     returncode, output = run_logged_command(
         cmd,
@@ -1041,10 +1059,26 @@ def select_preferred_media_files(files: list[Path]) -> list[Path]:
     return candidates
 
 
-def build_ytdlp_command(args: list[str]) -> list[str]:
+def has_video_file(paths: list[Path]) -> bool:
+    return any(path.suffix.lower() in VIDEO_SUFFIXES for path in paths)
+
+
+def should_retry_gallery_result_with_ytdlp(url: str, media_mode: str, paths: list[Path]) -> bool:
+    return media_mode == "video" and is_instagram_reel_url(url) and not has_video_file(paths)
+
+
+def cookies_file_for_url(url: str | None) -> str:
+    if url and is_instagram_url(url):
+        instagram_cookies = os.environ.get("BOT_INSTAGRAM_COOKIES_FILE", "").strip()
+        if instagram_cookies:
+            return instagram_cookies
+    return os.environ.get("BOT_COOKIES_FILE", "").strip()
+
+
+def build_ytdlp_command(args: list[str], url: str | None = None) -> list[str]:
     cmd = [sys.executable, "-m", "yt_dlp"]
     proxy = os.environ.get("BOT_YTDLP_PROXY", "").strip()
-    cookies = os.environ.get("BOT_COOKIES_FILE", "").strip()
+    cookies = cookies_file_for_url(url)
     if proxy:
         cmd.extend(["--proxy", proxy])
     if cookies:
