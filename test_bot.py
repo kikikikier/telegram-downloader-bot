@@ -332,6 +332,85 @@ class YtdlpFormatTests(unittest.TestCase):
         self.assertIn("b[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]", selector)
         self.assertNotIn("+ba", selector)
 
+    def test_video_download_without_large_route_uses_upload_safe_format_limit(self):
+        captured = {}
+
+        def fake_run_logged_command(cmd, cwd=None, timeout=None, label="cmd", on_output_line=None):
+            captured["cmd"] = cmd
+            return 0, ""
+
+        with patch.object(bot, "large_upload_route_available", return_value=False):
+            with patch.object(bot, "probe_upload_safe_video_format_id", return_value=None):
+                with patch.object(bot, "run_logged_command", side_effect=fake_run_logged_command):
+                    bot.download_files_with_ytdlp(
+                        "https://vkvideo.ru/video-94_456240146",
+                        FakeWorkdir([FakeFile("download.mp4", size=bot.MAX_BYTES - 1024)]),
+                        media_mode="video",
+                        quality="720",
+                    )
+
+        cmd = captured["cmd"]
+        selector = cmd[cmd.index("-f") + 1]
+        self.assertIn(f"[filesize_approx<={bot.MAX_BYTES}]", selector)
+        self.assertIn("--max-filesize", cmd)
+        self.assertEqual(bot.cli_size_arg(bot.MAX_BYTES), cmd[cmd.index("--max-filesize") + 1])
+
+    def test_vk_upload_safe_format_uses_bitrate_estimate_and_skips_video_only(self):
+        info = {
+            "duration": 1028,
+            "formats": [
+                {"format_id": "url720", "height": 720, "ext": "mp4", "vcodec": None, "acodec": None},
+                {"format_id": "hls-516", "height": 360, "ext": "mp4", "tbr": 516.821, "vcodec": None, "acodec": None},
+                {
+                    "format_id": "hls_fmp4-399",
+                    "height": 360,
+                    "ext": "mp4",
+                    "tbr": 399.509,
+                    "vcodec": "avc1.4D401E",
+                    "acodec": "none",
+                },
+                {"format_id": "hls-306", "height": 240, "ext": "mp4", "tbr": 306.274, "vcodec": None, "acodec": None},
+                {"format_id": "hls-218", "height": 144, "ext": "mp4", "tbr": 218.203, "vcodec": None, "acodec": None},
+            ],
+        }
+
+        selected = bot.select_upload_safe_video_format_id(info, "720", bot.MAX_BYTES)
+
+        self.assertEqual("hls-306", selected)
+
+    def test_vk_download_uses_probed_upload_safe_format_id(self):
+        captured = {}
+
+        def fake_run_logged_command(cmd, cwd=None, timeout=None, label="cmd", on_output_line=None):
+            captured["cmd"] = cmd
+            return 0, ""
+
+        with patch.object(bot, "large_upload_route_available", return_value=False):
+            with patch.object(bot, "probe_upload_safe_video_format_id", return_value="hls-306"):
+                with patch.object(bot, "run_logged_command", side_effect=fake_run_logged_command):
+                    bot.download_files_with_ytdlp(
+                        "https://vkvideo.ru/video-94_456240146",
+                        FakeWorkdir([FakeFile("download.mp4", size=bot.MAX_BYTES - 1024)]),
+                        media_mode="video",
+                        quality="720",
+                    )
+
+        cmd = captured["cmd"]
+        self.assertEqual("hls-306", cmd[cmd.index("-f") + 1])
+        self.assertIn("--max-filesize", cmd)
+
+    def test_video_download_without_large_route_rejects_oversized_result(self):
+        with patch.object(bot, "large_upload_route_available", return_value=False):
+            with patch.object(bot, "probe_upload_safe_video_format_id", return_value=None):
+                with patch.object(bot, "run_logged_command", return_value=(0, "")):
+                    with self.assertRaisesRegex(RuntimeError, "over the current upload limit"):
+                        bot.download_files_with_ytdlp(
+                            "https://vkvideo.ru/video-94_456240146",
+                            FakeWorkdir([FakeFile("download.mp4", size=bot.MAX_BYTES + 1)]),
+                            media_mode="video",
+                            quality="720",
+                        )
+
     def test_video_download_merge_selector_prefers_requested_4k_before_progressive_fallback(self):
         selector = bot.video_format_selector("2160", allow_merge=True)
         choices = selector.split("/")

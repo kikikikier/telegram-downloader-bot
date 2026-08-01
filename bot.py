@@ -381,6 +381,10 @@ def is_youtube_url(url: str) -> bool:
     return url_host_matches(url, ("youtube.com", "youtu.be", "youtube-nocookie.com"))
 
 
+def is_vk_video_url(url: str) -> bool:
+    return url_host_matches(url, ("vk.com", "vkvideo.ru"))
+
+
 def is_instagram_url(url: str) -> bool:
     return url_host_matches(url, ("instagram.com", "instagr.am"))
 
@@ -554,6 +558,63 @@ def estimate_format_bytes(fmt: dict, duration: int | float | None) -> int | None
     return None
 
 
+def is_single_file_video_candidate(fmt: dict) -> bool:
+    format_id = fmt.get("format_id")
+    if not isinstance(format_id, str) or not format_id:
+        return False
+    if "+" in format_id:
+        return False
+    if fmt.get("vcodec") == "none":
+        return False
+    if fmt.get("acodec") == "none":
+        return False
+    height = fmt.get("height")
+    return isinstance(height, int) and height > 0
+
+
+def select_upload_safe_video_format_id(
+    info: dict,
+    quality: str | None,
+    max_filesize_bytes: int,
+) -> str | None:
+    formats = info.get("formats") or []
+    duration = info.get("duration")
+    max_height = quality_max_height(quality)
+    candidates = []
+
+    for fmt in formats:
+        if not is_single_file_video_candidate(fmt):
+            continue
+        height = fmt.get("height")
+        if max_height and height > max_height:
+            continue
+        estimated = estimate_format_bytes(fmt, duration)
+        if not estimated or estimated > max_filesize_bytes:
+            continue
+        tbr = fmt.get("tbr")
+        candidates.append((
+            height,
+            float(tbr) if isinstance(tbr, (int, float)) else 0.0,
+            estimated,
+            fmt["format_id"],
+        ))
+
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True)
+    return candidates[0][3]
+
+
+def probe_upload_safe_video_format_id(
+    url: str,
+    quality: str | None,
+    max_filesize_bytes: int,
+) -> str | None:
+    info = probe_ytdlp_info(url)
+    return select_upload_safe_video_format_id(info, quality, max_filesize_bytes)
+
+
 def parse_audio_bitrate(value: str) -> int:
     match = re.search(r"(\d+)", value)
     if not match:
@@ -569,8 +630,38 @@ def max_optional_size(a: int | None, b: int | None) -> int | None:
     return max(a, b)
 
 
+def min_optional_size(a: int | None, b: int | None) -> int | None:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return min(a, b)
+
+
 def video_ffmpeg_merge_enabled() -> bool:
     return BOT_ENABLE_FFMPEG_MERGE and bool(shutil.which("ffmpeg"))
+
+
+def mtproto_upload_available() -> bool:
+    return bool(TELEGRAM_API_ID and TELEGRAM_API_HASH)
+
+
+def large_upload_route_available() -> bool:
+    return BOT_API_LOCAL or mtproto_upload_available()
+
+
+def effective_download_limit_bytes() -> int | None:
+    limit = DOWNLOAD_MAX_BYTES
+    if not large_upload_route_available():
+        limit = min_optional_size(limit, MAX_BYTES)
+    return limit
+
+
+def cli_size_arg(limit_bytes: int) -> str:
+    mb = 1024 * 1024
+    if limit_bytes % mb == 0:
+        return f"{limit_bytes // mb}M"
+    return str(limit_bytes)
 
 
 def quality_max_height(quality: str | None) -> int | None:
@@ -621,14 +712,32 @@ def merged_mp4_selectors(max_height: int | None) -> list[str]:
     return selectors
 
 
-def video_format_selector(quality: str | None, allow_merge: bool = False) -> str:
+def filesize_limited_selectors(selectors: list[str], max_filesize_bytes: int) -> list[str]:
+    limited = []
+    for selector in selectors:
+        limited.extend([
+            f"{selector}[filesize<={max_filesize_bytes}]",
+            f"{selector}[filesize_approx<={max_filesize_bytes}]",
+        ])
+    return limited
+
+
+def video_format_selector(
+    quality: str | None,
+    allow_merge: bool = False,
+    max_filesize_bytes: int | None = None,
+) -> str:
     max_height = quality_max_height(quality)
     if allow_merge:
         selectors = merged_mp4_selectors(max_height) + progressive_mp4_selectors(max_height)
     else:
         selectors = progressive_mp4_selectors(max_height)
-    fallback = f"best{height_filter(max_height)}/best" if max_height else "best"
-    selectors.append(fallback)
+    fallback_selectors = [f"best{height_filter(max_height)}"]
+    if max_height:
+        fallback_selectors.append("best")
+    selectors.extend(fallback_selectors)
+    if max_filesize_bytes:
+        selectors = filesize_limited_selectors(selectors, max_filesize_bytes) + fallback_selectors
     return "/".join(selectors)
 
 
@@ -1028,12 +1137,13 @@ def download_direct(url: str, workdir: Path, progress: DownloadProgressReporter 
     name = Path(urllib.parse.unquote(parsed.path)).name or "media"
     path = safe_target(workdir, name)
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    size_limit = effective_download_limit_bytes()
     logger.info("direct download start url=%s target=%s", safe_log_url(url), path.name)
     with media_urlopen(req, timeout=DOWNLOAD_TIMEOUT) as response:
         length = response.headers.get("content-length")
         total = int(length) if length and length.isdigit() else None
-        if DOWNLOAD_MAX_BYTES and total and total > DOWNLOAD_MAX_BYTES:
-            raise RuntimeError(f"remote file is {human_size(total)}, over download limit {DOWNLOAD_MAX_MB} MB")
+        if size_limit and total and total > size_limit:
+            raise RuntimeError(f"remote file is {human_size(total)}, over current upload limit {human_size(size_limit)}")
         written = 0
         if progress:
             progress.update_bytes(written, total)
@@ -1043,8 +1153,8 @@ def download_direct(url: str, workdir: Path, progress: DownloadProgressReporter 
                 if not chunk:
                     break
                 written += len(chunk)
-                if DOWNLOAD_MAX_BYTES and written > DOWNLOAD_MAX_BYTES:
-                    raise RuntimeError(f"file grew over download limit {DOWNLOAD_MAX_MB} MB")
+                if size_limit and written > size_limit:
+                    raise RuntimeError(f"file grew over current upload limit {human_size(size_limit)}")
                 out.write(chunk)
                 if progress:
                     progress.update_bytes(written, total)
@@ -1128,6 +1238,7 @@ def download_with_gallery_dl(
     workdir: Path,
     progress: DownloadProgressReporter | None = None,
 ) -> list[Path]:
+    size_limit = effective_download_limit_bytes()
     gallery_args = [
         "--config-ignore",
         "--no-part",
@@ -1137,8 +1248,8 @@ def download_with_gallery_dl(
         str(workdir),
         url,
     ]
-    if DOWNLOAD_MAX_MB:
-        gallery_args[1:1] = ["--filesize-max", f"{DOWNLOAD_MAX_MB}M"]
+    if size_limit:
+        gallery_args[1:1] = ["--filesize-max", cli_size_arg(size_limit)]
     cmd = build_gallery_dl_command(gallery_args)
 
     run_kwargs = {
@@ -1175,6 +1286,7 @@ def download_files_with_ytdlp(
     progress: DownloadProgressReporter | None = None,
 ) -> list[Path]:
     output_template = str(workdir / "%(title).80s-%(id)s.%(ext)s")
+    size_limit = effective_download_limit_bytes()
 
     if media_mode == "audio":
         if not shutil.which("ffmpeg"):
@@ -1194,8 +1306,21 @@ def download_files_with_ytdlp(
         if quality != "best" and not str(quality).isdigit():
             quality = "best"
 
-        allow_merge = is_youtube_url(url) and video_ffmpeg_merge_enabled()
-        format_selector = video_format_selector(quality, allow_merge=allow_merge)
+        allow_merge = is_youtube_url(url) and video_ffmpeg_merge_enabled() and large_upload_route_available()
+        format_selector = None
+        if size_limit and is_vk_video_url(url) and not allow_merge:
+            try:
+                format_selector = probe_upload_safe_video_format_id(url, quality, size_limit)
+                if format_selector:
+                    logger.info("selected upload-safe format url=%s format=%s", safe_log_url(url), format_selector)
+            except Exception as exc:
+                logger.warning("upload-safe format probe failed url=%s error=%s", safe_log_url(url), short_error(exc))
+        if not format_selector:
+            format_selector = video_format_selector(
+                quality,
+                allow_merge=allow_merge,
+                max_filesize_bytes=size_limit,
+            )
         merge_args = ["--merge-output-format", "mp4"] if allow_merge else []
         media_args = [*merge_args, "-f", format_selector]
 
@@ -1210,8 +1335,8 @@ def download_files_with_ytdlp(
         output_template,
         url,
     ]
-    if DOWNLOAD_MAX_MB:
-        ytdlp_args[1:1] = ["--max-filesize", f"{DOWNLOAD_MAX_MB}M"]
+    if size_limit:
+        ytdlp_args[1:1] = ["--max-filesize", cli_size_arg(size_limit)]
     cmd = build_ytdlp_command(ytdlp_args, url=url)
 
     run_kwargs = {
@@ -1232,12 +1357,24 @@ def download_files_with_ytdlp(
         and path.suffix.lower() in MEDIA_SUFFIXES
     ]
     if not files:
+        if size_limit and ("max-filesize" in output.lower() or "larger than" in output.lower()):
+            raise RuntimeError(
+                f"Selected media is over the current upload limit {human_size(size_limit)}."
+            )
         if "max-filesize" in output.lower() or "larger than" in output.lower():
             raise RuntimeError(
                 f"Выбранный файл больше защитного лимита скачивания {DOWNLOAD_MAX_MB} MB."
             )
         raise RuntimeError(output or "yt-dlp did not create a media file")
-    return select_preferred_media_files(files)
+    selected = select_preferred_media_files(files)
+    if size_limit:
+        oversized = [path for path in selected if path.stat().st_size > size_limit]
+        if oversized:
+            names = ", ".join(f"{path.name} ({human_size(path.stat().st_size)})" for path in oversized)
+            raise RuntimeError(
+                f"Downloaded media is over the current upload limit {human_size(size_limit)}: {names}"
+            )
+    return selected
 
 
 def select_downloaded_media_file(workdir: Path) -> Path:
@@ -1557,10 +1694,6 @@ def send_image_gallery(
         send_media_group(chat_id, "document", capped, progress=progress)
     else:
         send_media_group(chat_id, "document", capped)
-
-
-def mtproto_upload_available() -> bool:
-    return bool(TELEGRAM_API_ID and TELEGRAM_API_HASH)
 
 
 def send_large_media_via_mtproto(
