@@ -33,6 +33,8 @@ Config:
 TELEGRAM_API_ID=replace_me
 TELEGRAM_API_HASH=replace_me
 BOT_LARGE_UPLOAD_MODE=document
+BOT_MTPROTO_RETRIES=3
+BOT_MTPROTO_RETRY_DELAY_SECONDS=5
 ```
 
 `document` is the safest default for large files. `both` sends a preview plus raw document but uploads the file twice.

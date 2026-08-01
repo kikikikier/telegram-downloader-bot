@@ -409,6 +409,20 @@ class YtdlpFormatTests(unittest.TestCase):
         self.assertEqual(456, edits[-1][1])
         self.assertIn("37%", edits[-1][2])
 
+    def test_ytdlp_progress_maps_to_active_stage_range(self):
+        edits = []
+        progress = bot.DownloadProgressReporter(
+            123,
+            456,
+            min_interval=0,
+            edit_func=lambda chat_id, message_id, text: edits.append(text),
+        )
+
+        progress.set_stage("Скачиваю", 5, 70)
+        progress.handle_ytdlp_line("[download]  50.0% of   20.00MiB at    6.50MiB/s ETA 00:01")
+
+        self.assertIn("38%", edits[-1])
+
     def test_ffmpeg_progress_line_updates_progress_by_duration(self):
         edits = []
         progress = bot.DownloadProgressReporter(
@@ -457,6 +471,60 @@ class UserReplicaTests(unittest.TestCase):
         send_preview.assert_called_once_with(123, media, "")
         send_document.assert_called_once_with(123, media, caption="")
 
+    def test_small_upload_reports_preview_and_document_stages(self):
+        media = FakeFile("download.mp4", size=1024)
+        edits = []
+        progress = bot.DownloadProgressReporter(
+            123,
+            456,
+            min_interval=0,
+            edit_func=lambda chat_id, message_id, text: edits.append(text),
+        )
+
+        with patch.object(bot, "send_message"):
+            with patch.object(bot, "send_media_preview", return_value=True):
+                with patch.object(bot, "send_document"):
+                    bot.send_small_media_and_document(123, media, progress=progress)
+
+        text = "\n".join(edits)
+        self.assertIn("Отправляю превью", text)
+        self.assertIn("Отправляю файл", text)
+
+    def test_handle_url_finishes_progress_after_upload_route(self):
+        media = FakeFile("download.mp4", size=1024)
+        workdir = FakeWorkdir([media])
+        events = []
+
+        class FakeProgress:
+            def set_stage(self, label, start, end):
+                events.append(("stage", label, start, end))
+
+            def update(self, percent, label=None, force=False):
+                events.append(("update", label, int(percent)))
+
+            def finish(self):
+                events.append("finish")
+
+            def fail(self):
+                events.append("fail")
+
+        progress = FakeProgress()
+
+        def fake_send_media(chat_id, path, progress=None, **kwargs):
+            events.append(("send", progress is progress_obj))
+
+        progress_obj = progress
+        with patch.object(bot, "TMP_ROOT", FakeTmpRoot(workdir)):
+            with patch.object(bot, "mark_workdir_active"):
+                with patch.object(bot, "schedule_workdir_cleanup"):
+                    with patch.object(bot, "start_progress_message", return_value=progress):
+                        with patch.object(bot, "download_media_files_for_url", return_value=[media]):
+                            with patch.object(bot, "send_message"):
+                                with patch.object(bot, "send_media_and_document", side_effect=fake_send_media):
+                                    bot.handle_url(123, "https://www.youtube.com/watch?v=videoid")
+
+        self.assertLess(events.index(("send", True)), events.index("finish"))
+
     def test_mtproto_upload_announces_ready_separately_and_uses_empty_caption(self):
         media = FakeFile("large.mp4", size=1024)
 
@@ -466,7 +534,27 @@ class UserReplicaTests(unittest.TestCase):
 
         self.assertEqual(2, send_message.call_count)
         self.assertIn(send_message.call_args_list[1].args[1], bot.FILE_READY_MESSAGES)
-        upload.assert_called_once_with(123, media, caption="", mode=bot.LARGE_UPLOAD_MODE)
+        upload.assert_called_once_with(123, media, caption="", mode=bot.LARGE_UPLOAD_MODE, progress=None)
+
+    def test_mtproto_upload_retries_transient_command_failure(self):
+        media = FakeFile("large.mp4", size=1024)
+
+        with patch.object(bot, "run_logged_command", side_effect=[(1, "temporary"), (0, "ok")]) as run_command:
+            with patch.object(bot.time, "sleep") as sleep:
+                bot.run_mtproto_upload(123, media, caption="", mode="document")
+
+        self.assertEqual(2, run_command.call_count)
+        sleep.assert_called_once()
+
+    def test_mtproto_upload_raises_after_retry_attempts_are_exhausted(self):
+        media = FakeFile("large.mp4", size=1024)
+
+        with patch.object(bot, "run_logged_command", return_value=(1, "still down")) as run_command:
+            with patch.object(bot.time, "sleep"):
+                with self.assertRaisesRegex(RuntimeError, "still down"):
+                    bot.run_mtproto_upload(123, media, caption="", mode="document")
+
+        self.assertEqual(bot.MTPROTO_RETRIES, run_command.call_count)
 
     def test_large_upload_without_large_file_route_fails_instead_of_splitting(self):
         media = FakeFile("large.mp4", size=bot.MAX_BYTES + 1)

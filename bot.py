@@ -70,6 +70,8 @@ ADMIN_CHAT_ID = os.environ.get("BOT_ADMIN_CHAT_ID", "").strip()
 TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", "").strip() or os.environ.get("APP_ID", "").strip()
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip() or os.environ.get("APP_HASH", "").strip()
 UPLOAD_TIMEOUT = int(os.environ.get("BOT_UPLOAD_TIMEOUT", "7200"))
+MTPROTO_RETRIES = max(1, int(os.environ.get("BOT_MTPROTO_RETRIES", "3")))
+MTPROTO_RETRY_DELAY_SECONDS = float(os.environ.get("BOT_MTPROTO_RETRY_DELAY_SECONDS", "5"))
 MTPROTO_MAX_MB = int(os.environ.get("BOT_MTPROTO_MAX_MB", "2000"))
 MTPROTO_MAX_BYTES = MTPROTO_MAX_MB * 1024 * 1024
 LARGE_UPLOAD_MODE = os.environ.get("BOT_LARGE_UPLOAD_MODE", "document").strip().lower()
@@ -84,6 +86,7 @@ logger = logging.getLogger("telegram-downloader-bot")
 URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
 YTDLP_PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 FFMPEG_OUT_TIME_RE = re.compile(r"out_time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)%")
 DIRECT_MEDIA_RE = re.compile(
     r"\.(mp4|webm|mov|m4v|jpg|jpeg|png|gif|webp|mp3|m4a|aac|wav|flac|ogg|opus)(?:[?#].*)?$",
     re.IGNORECASE,
@@ -712,6 +715,9 @@ class DownloadProgressReporter:
         self.edit_func = edit_func
         self.last_update_at = -self.min_interval
         self.last_rounded: int | None = None
+        self.stage_label = label
+        self.stage_start = 0.0
+        self.stage_end = 100.0
 
     def update(self, percent: float, label: str | None = None, force: bool = False) -> None:
         percent = clamp_percent(percent)
@@ -733,12 +739,40 @@ class DownloadProgressReporter:
 
     def update_bytes(self, written: int, total: int | None) -> None:
         if total and total > 0:
-            self.update(written * 100 / total)
+            self.update_stage_percent(written * 100 / total)
+
+    def set_stage(self, label: str, start: float, end: float) -> None:
+        start = clamp_percent(start)
+        end = clamp_percent(end)
+        if end < start:
+            start, end = end, start
+        self.stage_label = label
+        self.stage_start = start
+        self.stage_end = end
+        self.update(start, label=label, force=True)
+
+    def update_stage_percent(self, percent: float, label: str | None = None, force: bool = False) -> None:
+        percent = clamp_percent(percent)
+        span = self.stage_end - self.stage_start
+        self.update(self.stage_start + span * percent / 100, label=label or self.stage_label, force=force)
 
     def handle_ytdlp_line(self, line: str) -> None:
         percent = parse_ytdlp_progress_percent(line)
         if percent is not None:
-            self.update(percent, label="Скачиваю")
+            self.update_stage_percent(percent)
+
+    def handle_gallery_line(self, line: str) -> None:
+        percent = parse_ytdlp_progress_percent(line)
+        if percent is None:
+            match = PERCENT_RE.search(line)
+            percent = float(match.group(1)) if match else None
+        if percent is not None:
+            self.update_stage_percent(percent)
+
+    def handle_mtproto_line(self, line: str) -> None:
+        match = PERCENT_RE.search(line)
+        if match:
+            self.update_stage_percent(float(match.group(1)))
 
     def handle_ffmpeg_line(self, line: str, duration: float | None) -> None:
         percent = parse_ffmpeg_out_time_percent(line, duration)
@@ -920,7 +954,9 @@ def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str |
     )
     try:
         send_message(chat_id, pick(ACCEPT_MESSAGES))
-        progress = start_progress_message(chat_id)
+        progress = start_progress_message(chat_id, label="Готовлю ссылку")
+        if progress:
+            progress.set_stage("Скачиваю", 5, 70)
         media_paths = download_media_files_for_url(
             url,
             workdir,
@@ -937,22 +973,36 @@ def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str |
             return
 
         total_size = sum(path.stat().st_size for path in media_paths)
+        if progress:
+            progress.update(70, label="Проверяю файл", force=True)
         logger.info(
             "download complete files=%s size=%s",
             ", ".join(path.name for path in media_paths),
             human_size(total_size),
         )
-        if progress:
-            progress.finish()
         send_message(chat_id, pick(DOWNLOADED_MESSAGES))
         if is_image_gallery(media_paths):
-            send_image_gallery(chat_id, media_paths)
+            if progress:
+                send_image_gallery(chat_id, media_paths, progress=progress)
+            else:
+                send_image_gallery(chat_id, media_paths)
         else:
-            for media_path in media_paths:
+            total_files = len(media_paths)
+            for index, media_path in enumerate(media_paths):
+                upload_start = 72 + (26 * index / max(total_files, 1))
+                upload_end = 72 + (26 * (index + 1) / max(total_files, 1))
                 if progress:
-                    send_media_and_document(chat_id, media_path, progress=progress)
+                    send_media_and_document(
+                        chat_id,
+                        media_path,
+                        progress=progress,
+                        upload_start=upload_start,
+                        upload_end=upload_end,
+                    )
                 else:
                     send_media_and_document(chat_id, media_path)
+        if progress:
+            progress.finish()
         logger.info(
             "job done chat_id=%s files=%s elapsed=%.1fs",
             chat_id,
@@ -1016,7 +1066,7 @@ def download_media_for_url(
 
     if is_instagram_url(url) and not is_instagram_reel_url(url) and media_mode == "video":
         try:
-            return download_instagram_with_gallery_dl(url, workdir)
+            return download_instagram_with_gallery_dl(url, workdir, progress=progress)
         except Exception as exc:
             logger.exception(
                 "instagram gallery-dl failed, falling back to yt-dlp url=%s error=%s",
@@ -1041,7 +1091,7 @@ def download_media_files_for_url(
 
     if is_gallery_first_url(url) and media_mode == "video":
         try:
-            gallery_files = download_with_gallery_dl(url, workdir)
+            gallery_files = download_with_gallery_dl(url, workdir, progress=progress)
             if should_retry_gallery_result_with_ytdlp(url, media_mode, gallery_files):
                 logger.warning(
                     "gallery-dl returned no video for instagram reel, falling back to yt-dlp url=%s files=%s",
@@ -1062,14 +1112,22 @@ def download_media_files_for_url(
     return download_files_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality)
 
 
-def download_instagram_with_gallery_dl(url: str, workdir: Path) -> Path:
-    files = download_with_gallery_dl(url, workdir)
+def download_instagram_with_gallery_dl(
+    url: str,
+    workdir: Path,
+    progress: DownloadProgressReporter | None = None,
+) -> Path:
+    files = download_with_gallery_dl(url, workdir, progress=progress)
     if should_retry_gallery_result_with_ytdlp(url, "video", files):
         raise RuntimeError("gallery-dl returned no video for instagram reel")
     return files[0]
 
 
-def download_with_gallery_dl(url: str, workdir: Path) -> list[Path]:
+def download_with_gallery_dl(
+    url: str,
+    workdir: Path,
+    progress: DownloadProgressReporter | None = None,
+) -> list[Path]:
     gallery_args = [
         "--config-ignore",
         "--no-part",
@@ -1083,12 +1141,14 @@ def download_with_gallery_dl(url: str, workdir: Path) -> list[Path]:
         gallery_args[1:1] = ["--filesize-max", f"{DOWNLOAD_MAX_MB}M"]
     cmd = build_gallery_dl_command(gallery_args)
 
-    returncode, output = run_logged_command(
-        cmd,
-        cwd=workdir,
-        timeout=DOWNLOAD_TIMEOUT,
-        label="gallery-dl",
-    )
+    run_kwargs = {
+        "cwd": workdir,
+        "timeout": DOWNLOAD_TIMEOUT,
+        "label": "gallery-dl",
+    }
+    if progress:
+        run_kwargs["on_output_line"] = progress.handle_gallery_line
+    returncode, output = run_logged_command(cmd, **run_kwargs)
     if returncode != 0:
         raise RuntimeError(output or "gallery-dl failed")
 
@@ -1388,16 +1448,34 @@ def answer_callback_query(callback_id: str) -> None:
         logger.warning("answer callback failed: %s", short_error(exc))
 
 
-def send_document(chat_id: int, path: Path, caption: str = "") -> None:
+def send_document(
+    chat_id: int,
+    path: Path,
+    caption: str = "",
+    progress: DownloadProgressReporter | None = None,
+) -> None:
     fields = {
         "chat_id": str(chat_id),
         "caption": caption[:1024],
         "disable_content_type_detection": "true",
     }
-    upload_file("sendDocument", fields, "document", path, mime_override="application/octet-stream")
+    upload_file(
+        "sendDocument",
+        fields,
+        "document",
+        path,
+        mime_override="application/octet-stream",
+        progress=progress,
+    )
 
 
-def send_media_and_document(chat_id: int, path: Path, progress: DownloadProgressReporter | None = None) -> None:
+def send_media_and_document(
+    chat_id: int,
+    path: Path,
+    progress: DownloadProgressReporter | None = None,
+    upload_start: float = 72,
+    upload_end: float = 98,
+) -> None:
     size = path.stat().st_size
     logger.info(
         "upload route file=%s size=%s limit=%s local_bot_api=%s mtproto=%s",
@@ -1408,12 +1486,24 @@ def send_media_and_document(chat_id: int, path: Path, progress: DownloadProgress
         mtproto_upload_available(),
     )
     if size <= MAX_BYTES:
-        send_small_media_and_document(chat_id, path)
+        send_small_media_and_document(
+            chat_id,
+            path,
+            progress=progress,
+            upload_start=upload_start,
+            upload_end=upload_end,
+        )
         return
 
     if mtproto_upload_available() and size <= MTPROTO_MAX_BYTES:
         try:
-            send_large_media_via_mtproto(chat_id, path)
+            send_large_media_via_mtproto(
+                chat_id,
+                path,
+                progress=progress,
+                upload_start=upload_start,
+                upload_end=upload_end,
+            )
             return
         except Exception as exc:
             logger.exception("MTProto upload failed, no split fallback: %s", short_error(exc))
@@ -1436,7 +1526,11 @@ def is_image_gallery(paths: list[Path]) -> bool:
     return len(paths) > 1 and all(path.suffix.lower() in IMAGE_SUFFIXES for path in paths)
 
 
-def send_image_gallery(chat_id: int, paths: list[Path]) -> None:
+def send_image_gallery(
+    chat_id: int,
+    paths: list[Path],
+    progress: DownloadProgressReporter | None = None,
+) -> None:
     capped = paths[:MEDIA_GROUP_LIMIT]
     if not capped:
         return
@@ -1446,24 +1540,50 @@ def send_image_gallery(chat_id: int, paths: list[Path]) -> None:
     send_message(chat_id, pick(FILE_READY_MESSAGES))
     photo_paths = [path for path in capped if path.suffix.lower() in PHOTO_ALBUM_SUFFIXES]
     if len(photo_paths) >= 2:
-        send_media_group(chat_id, "photo", photo_paths)
+        if progress:
+            progress.set_stage("Отправляю альбом", 72, 84)
+            send_media_group(chat_id, "photo", photo_paths, progress=progress)
+        else:
+            send_media_group(chat_id, "photo", photo_paths)
     elif len(photo_paths) == 1:
-        send_media_preview(chat_id, photo_paths[0], "")
+        if progress:
+            progress.set_stage("Отправляю превью", 72, 84)
+            send_media_preview(chat_id, photo_paths[0], "", progress=progress)
+        else:
+            send_media_preview(chat_id, photo_paths[0], "")
 
-    send_media_group(chat_id, "document", capped)
+    if progress:
+        progress.set_stage("Отправляю файлы", 84, 98)
+        send_media_group(chat_id, "document", capped, progress=progress)
+    else:
+        send_media_group(chat_id, "document", capped)
 
 
 def mtproto_upload_available() -> bool:
     return bool(TELEGRAM_API_ID and TELEGRAM_API_HASH)
 
 
-def send_large_media_via_mtproto(chat_id: int, path: Path) -> None:
+def send_large_media_via_mtproto(
+    chat_id: int,
+    path: Path,
+    progress: DownloadProgressReporter | None = None,
+    upload_start: float = 72,
+    upload_end: float = 98,
+) -> None:
     send_message(chat_id, pick(LARGE_SEND_MESSAGES))
     send_message(chat_id, pick(FILE_READY_MESSAGES))
-    run_mtproto_upload(chat_id, path, caption="", mode=LARGE_UPLOAD_MODE)
+    if progress:
+        progress.set_stage("Отправляю большой файл", upload_start, upload_end)
+    run_mtproto_upload(chat_id, path, caption="", mode=LARGE_UPLOAD_MODE, progress=progress)
 
 
-def run_mtproto_upload(chat_id: int, path: Path, caption: str, mode: str) -> None:
+def run_mtproto_upload(
+    chat_id: int,
+    path: Path,
+    caption: str,
+    mode: str,
+    progress: DownloadProgressReporter | None = None,
+) -> None:
     script = Path(__file__).with_name("mtproto_upload.py")
     cmd = [
         sys.executable,
@@ -1477,17 +1597,46 @@ def run_mtproto_upload(chat_id: int, path: Path, caption: str, mode: str) -> Non
         "--mode",
         mode,
     ]
-    returncode, output = run_logged_command(
-        cmd,
-        cwd=Path(__file__).parent,
-        timeout=UPLOAD_TIMEOUT,
-        label="mtproto",
-    )
-    if returncode != 0:
-        raise RuntimeError(output or "MTProto upload failed")
+    run_kwargs = {
+        "cwd": Path(__file__).parent,
+        "timeout": UPLOAD_TIMEOUT,
+        "label": "mtproto",
+    }
+    if progress:
+        run_kwargs["on_output_line"] = progress.handle_mtproto_line
+    last_output = ""
+    for attempt in range(1, MTPROTO_RETRIES + 1):
+        if progress and attempt > 1:
+            progress.set_stage(f"Повторяю отправку {attempt}/{MTPROTO_RETRIES}", 72, 98)
+        try:
+            returncode, output = run_logged_command(cmd, **run_kwargs)
+        except Exception as exc:
+            returncode = 1
+            output = short_error(exc)
+        if returncode == 0:
+            return
+
+        last_output = output or "MTProto upload failed"
+        if attempt < MTPROTO_RETRIES:
+            logger.warning(
+                "MTProto upload attempt failed attempt=%s/%s error=%s",
+                attempt,
+                MTPROTO_RETRIES,
+                redact_secret_text(last_output[-500:]),
+            )
+            time.sleep(MTPROTO_RETRY_DELAY_SECONDS * attempt)
+
+    raise RuntimeError(last_output or "MTProto upload failed")
 
 
-def send_small_media_and_document(chat_id: int, path: Path, caption_prefix: str = "") -> None:
+def send_small_media_and_document(
+    chat_id: int,
+    path: Path,
+    caption_prefix: str = "",
+    progress: DownloadProgressReporter | None = None,
+    upload_start: float = 72,
+    upload_end: float = 98,
+) -> None:
     if caption_prefix:
         send_message(chat_id, caption_prefix)
     else:
@@ -1500,16 +1649,38 @@ def send_small_media_and_document(chat_id: int, path: Path, caption_prefix: str 
             human_size(path.stat().st_size),
             human_size(PREVIEW_MAX_BYTES),
         )
-        send_document(chat_id, path, caption=caption)
+        if progress:
+            progress.set_stage("Отправляю файл", upload_start, upload_end)
+            send_document(chat_id, path, caption=caption, progress=progress)
+        else:
+            send_document(chat_id, path, caption=caption)
         return
-    preview_sent = send_media_preview(chat_id, path, caption)
-    if preview_sent:
-        send_document(chat_id, path, caption="")
+    preview_end = upload_start + (upload_end - upload_start) * 0.45
+    if progress:
+        progress.set_stage("Отправляю превью", upload_start, preview_end)
+        preview_sent = send_media_preview(chat_id, path, caption, progress=progress)
     else:
-        send_document(chat_id, path, caption=caption)
+        preview_sent = send_media_preview(chat_id, path, caption)
+    if preview_sent:
+        if progress:
+            progress.set_stage("Отправляю файл", preview_end, upload_end)
+            send_document(chat_id, path, caption="", progress=progress)
+        else:
+            send_document(chat_id, path, caption="")
+    else:
+        if progress:
+            progress.set_stage("Отправляю файл", preview_end, upload_end)
+            send_document(chat_id, path, caption=caption, progress=progress)
+        else:
+            send_document(chat_id, path, caption=caption)
 
 
-def send_media_preview(chat_id: int, path: Path, caption: str) -> bool:
+def send_media_preview(
+    chat_id: int,
+    path: Path,
+    caption: str,
+    progress: DownloadProgressReporter | None = None,
+) -> bool:
     method, field = media_method_for_path(path)
     if not method:
         return False
@@ -1520,7 +1691,7 @@ def send_media_preview(chat_id: int, path: Path, caption: str) -> bool:
         }
         if method == "sendVideo":
             fields["supports_streaming"] = "true"
-        upload_file(method, fields, field, path)
+        upload_file(method, fields, field, path, progress=progress)
         return True
     except Exception as exc:
         logger.warning("media preview failed file=%s error=%s", path.name, short_error(exc))
@@ -1541,7 +1712,12 @@ def media_method_for_path(path: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
-def send_media_group(chat_id: int, media_kind: str, paths: list[Path]) -> None:
+def send_media_group(
+    chat_id: int,
+    media_kind: str,
+    paths: list[Path],
+    progress: DownloadProgressReporter | None = None,
+) -> None:
     if not 2 <= len(paths) <= MEDIA_GROUP_LIMIT:
         raise ValueError("sendMediaGroup requires 2-10 media items")
     if media_kind not in {"photo", "document"}:
@@ -1557,7 +1733,7 @@ def send_media_group(chat_id: int, media_kind: str, paths: list[Path]) -> None:
             for path in paths
         ]
         logger.info("bot api local media group type=%s files=%s", media_type, len(paths))
-        api_json(
+        result = api_json(
             "sendMediaGroup",
             {
                 "chat_id": str(chat_id),
@@ -1565,7 +1741,9 @@ def send_media_group(chat_id: int, media_kind: str, paths: list[Path]) -> None:
             },
             timeout=UPLOAD_TIMEOUT,
         )
-        return
+        if progress:
+            progress.update_stage_percent(100, force=True)
+        return result
 
     media = [
         {
@@ -1581,6 +1759,7 @@ def send_media_group(chat_id: int, media_kind: str, paths: list[Path]) -> None:
             "media": json.dumps(media, ensure_ascii=False),
         },
         {f"file{index}": path for index, path in enumerate(paths)},
+        progress=progress,
     )
 
 
@@ -1601,6 +1780,7 @@ def upload_file(
     file_field: str,
     path: Path,
     mime_override: str | None = None,
+    progress: DownloadProgressReporter | None = None,
 ) -> dict:
     if BOT_API_LOCAL:
         params = dict(fields)
@@ -1612,7 +1792,12 @@ def upload_file(
             path.name,
             human_size(path.stat().st_size),
         )
-        return api_json(method, params, timeout=UPLOAD_TIMEOUT)
+        if progress:
+            progress.update_stage_percent(10, force=True)
+        payload = api_json(method, params, timeout=UPLOAD_TIMEOUT)
+        if progress:
+            progress.update_stage_percent(100, force=True)
+        return payload
 
     boundary = "----boardbot" + uuid.uuid4().hex
     mime = mime_override or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
@@ -1645,14 +1830,23 @@ def upload_file(
         path.name,
         human_size(path.stat().st_size),
     )
+    if progress:
+        progress.update_stage_percent(10, force=True)
     with urlopen(req, timeout=UPLOAD_TIMEOUT) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if not payload.get("ok"):
         raise RuntimeError(payload)
+    if progress:
+        progress.update_stage_percent(100, force=True)
     return payload
 
 
-def upload_files(method: str, fields: dict, files: dict[str, Path]) -> dict:
+def upload_files(
+    method: str,
+    fields: dict,
+    files: dict[str, Path],
+    progress: DownloadProgressReporter | None = None,
+) -> dict:
     boundary = "----boardbot" + uuid.uuid4().hex
     body = bytearray()
 
@@ -1680,10 +1874,14 @@ def upload_files(method: str, fields: dict, files: dict[str, Path]) -> dict:
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
     logger.info("bot api multipart upload method=%s files=%s", method, len(files))
+    if progress:
+        progress.update_stage_percent(10, force=True)
     with urlopen(req, timeout=UPLOAD_TIMEOUT) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if not payload.get("ok"):
         raise RuntimeError(payload)
+    if progress:
+        progress.update_stage_percent(100, force=True)
     return payload
 
 

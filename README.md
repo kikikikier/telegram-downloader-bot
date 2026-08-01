@@ -66,7 +66,7 @@ Upload route:
 
 1. If the file fits `BOT_MAX_MB`, send through Bot API.
 2. If `BOT_API_LOCAL=1` and `BOT_API_BASE` points to a local `telegram-bot-api --local` server, Bot API can upload up to 2000 MB using `file://` local paths.
-3. If `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are configured, files over cloud Bot API limits are sent through MTProto/Telethon.
+3. If `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are configured, files over cloud Bot API limits are sent through MTProto/Telethon with retry attempts controlled by `BOT_MTPROTO_RETRIES`.
 4. If no single-file large upload route is configured, the bot fails the job clearly instead of splitting the media into parts.
 
 Cloud `api.telegram.org` still has the classic bot upload limit. For serious large files, use either a local Bot API server or MTProto credentials.
