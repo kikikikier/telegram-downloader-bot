@@ -37,21 +37,6 @@ BOT_LARGE_UPLOAD_MODE=document
 
 `document` is the safest default for large files. `both` sends a preview plus raw document but uploads the file twice.
 
-## 3. Split Fallback
-
-Last resort when single-file upload cannot be used.
-
-- Uses ffmpeg segment muxer.
-- Produces playable parts around `BOT_PART_MB`.
-- Sends a concat list for reassembly.
-
-Config:
-
-```env
-BOT_PART_MB=48
-```
-
-## 4. External File Host
+## 3. External File Host
 
 Some public GitHub downloader bots upload files over 50 MB to an external host and return a link. This is simple, but it changes the privacy/security model and depends on a third-party service, so this project does not use it by default.
-

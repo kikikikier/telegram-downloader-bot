@@ -54,8 +54,6 @@ MAX_MB = int(os.environ.get("BOT_MAX_MB", DEFAULT_MAX_MB))
 MAX_BYTES = MAX_MB * 1024 * 1024
 PREVIEW_MAX_MB = int(os.environ.get("BOT_PREVIEW_MAX_MB", "49"))
 PREVIEW_MAX_BYTES = PREVIEW_MAX_MB * 1024 * 1024
-PART_MB = int(os.environ.get("BOT_PART_MB", "48"))
-PART_BYTES = min(PART_MB * 1024 * 1024, MAX_BYTES)
 DOWNLOAD_MAX_MB = int(os.environ.get("BOT_DOWNLOAD_MAX_MB", "0"))
 DOWNLOAD_MAX_BYTES = DOWNLOAD_MAX_MB * 1024 * 1024 if DOWNLOAD_MAX_MB else None
 DOWNLOAD_TIMEOUT = int(os.environ.get("BOT_DOWNLOAD_TIMEOUT", "900"))
@@ -193,16 +191,6 @@ LARGE_SEND_MESSAGES = (
     "Благодать крупная, но дверные ручки уже предупреждены.",
     "Сверток тяжёлый. Иду медленно, но уверенно.",
 )
-FALLBACK_MESSAGES = (
-    "Одна дверь не открылась. Иду через запасной коридор.",
-    "Благодать споткнулась, но маршрут ещё есть.",
-    "Главный проход капризничает. Несу обходным путём.",
-)
-SPLIT_MESSAGES = (
-    "Разложу посылку на аккуратные части. Так она пройдёт тише.",
-    "Большой сверток пойдёт кусочками. Дверные ручки ничего не заметят.",
-    "Нарежу благодать аккуратно и отправлю по частям.",
-)
 PREVIEW_FAIL_MESSAGES = (
     "Превью спряталось под ковёр. Отправляю как файл.",
     "Картинка для витрины не вышла. Сам сверток цел.",
@@ -239,12 +227,11 @@ def main() -> None:
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
     start_cleanup_worker()
     logger.info(
-        "boot config api_base=%s local_bot_api=%s max_mb=%s preview_max_mb=%s part_mb=%s mtproto=%s mtproto_max_mb=%s large_mode=%s cleanup_delay=%ss tmp=%s",
+        "boot config api_base=%s local_bot_api=%s max_mb=%s preview_max_mb=%s mtproto=%s mtproto_max_mb=%s large_mode=%s cleanup_delay=%ss tmp=%s",
         redacted_api_base(),
         BOT_API_LOCAL,
         MAX_MB,
         PREVIEW_MAX_MB,
-        PART_MB,
         mtproto_upload_available(),
         MTPROTO_MAX_MB,
         LARGE_UPLOAD_MODE,
@@ -778,9 +765,6 @@ def start_progress_message(chat_id: int, label: str = "Скачиваю") -> Dow
         return None
     return DownloadProgressReporter(chat_id, message_id, label=label)
 
-
-def part_caption(index: int, total: int) -> str:
-    return f"Кусочек {index}/{total}. Благодать нарезана аккуратно."
 
 
 def start_cleanup_worker() -> None:
@@ -1432,17 +1416,20 @@ def send_media_and_document(chat_id: int, path: Path, progress: DownloadProgress
             send_large_media_via_mtproto(chat_id, path)
             return
         except Exception as exc:
-            logger.exception("MTProto upload failed, falling back to parts: %s", short_error(exc))
-            send_message(chat_id, pick(FALLBACK_MESSAGES))
+            logger.exception("MTProto upload failed, no split fallback: %s", short_error(exc))
+            raise RuntimeError(f"MTProto upload failed: {short_error(exc)}") from exc
 
     if size > MTPROTO_MAX_BYTES and mtproto_upload_available():
-        logger.warning(
-            "file is over MTProto max, using parts file=%s size=%s mtproto_max=%s",
-            path.name,
-            human_size(size),
-            human_size(MTPROTO_MAX_BYTES),
+        raise RuntimeError(
+            "Large file exceeds configured MTProto limit: "
+            f"{human_size(size)} > {human_size(MTPROTO_MAX_BYTES)}"
         )
-    send_large_media_parts(chat_id, path, progress=progress)
+
+    raise RuntimeError(
+        "Large file upload is not configured: "
+        f"{path.name} is {human_size(size)}, cloud Bot API limit is {human_size(MAX_BYTES)}. "
+        "Configure BOT_API_LOCAL=1 with a local Bot API server or TELEGRAM_API_ID/TELEGRAM_API_HASH for MTProto."
+    )
 
 
 def is_image_gallery(paths: list[Path]) -> bool:
@@ -1520,138 +1507,6 @@ def send_small_media_and_document(chat_id: int, path: Path, caption_prefix: str 
         send_document(chat_id, path, caption="")
     else:
         send_document(chat_id, path, caption=caption)
-
-
-def send_large_media_parts(chat_id: int, path: Path, progress: DownloadProgressReporter | None = None) -> None:
-    send_message(chat_id, pick(SPLIT_MESSAGES))
-    segments = split_media_with_ffmpeg(path, progress=progress)
-    if not segments:
-        raise RuntimeError("ffmpeg did not create segments")
-
-    total = len(segments)
-    for index, segment in enumerate(segments, start=1):
-        send_small_media_and_document(chat_id, segment, caption_prefix=part_caption(index, total))
-
-
-def split_media_with_ffmpeg(path: Path, progress: DownloadProgressReporter | None = None) -> list[Path]:
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError("ffmpeg is not installed")
-
-    duration = probe_media_duration(path)
-    if duration and duration > 0:
-        segment_time = max(5, int(duration * PART_BYTES * 0.88 / max(path.stat().st_size, 1)))
-    else:
-        segment_time = 60
-    segment_time = max(5, segment_time)
-
-    suffix = normalized_segment_suffix(path)
-    pattern = path.with_name(f"{path.stem}.part%03d{suffix}")
-    last_error = ""
-
-    for _attempt in range(6):
-        cleanup_existing_segments(path.parent, path.stem, suffix)
-        logger.info("ffmpeg split attempt segment_time=%ss target_part=%s", segment_time, human_size(PART_BYTES))
-        if progress:
-            progress.update(0, label="Готовлю файл", force=True)
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            os.environ.get("BOT_FFMPEG_LOGLEVEL", "error"),
-            "-nostats",
-            "-progress",
-            "pipe:1",
-            "-y",
-            "-i",
-            str(path),
-            "-map",
-            "0",
-            "-c",
-            "copy",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(segment_time),
-            "-reset_timestamps",
-            "1",
-            str(pattern),
-        ]
-        run_kwargs = {
-            "timeout": max(DOWNLOAD_TIMEOUT, 600),
-            "label": "ffmpeg-split",
-        }
-        if progress:
-            run_kwargs["on_output_line"] = (
-                lambda line, media_duration=duration: progress.handle_ffmpeg_line(line, media_duration)
-            )
-        returncode, output = run_logged_command(cmd, **run_kwargs)
-        if returncode != 0:
-            last_error = output
-            break
-
-        segments = sorted(path.parent.glob(f"{path.stem}.part*{suffix}"))
-        logger.info(
-            "ffmpeg split produced %s segments: %s",
-            len(segments),
-            ", ".join(f"{segment.name}={human_size(segment.stat().st_size)}" for segment in segments[:8]),
-        )
-        if segments and all(segment.stat().st_size <= MAX_BYTES for segment in segments):
-            if progress:
-                progress.update(100, label="Файл подготовлен", force=True)
-            return segments
-        segment_time = max(3, int(segment_time * 0.65))
-
-    too_big = [
-        f"{segment.name} {human_size(segment.stat().st_size)}"
-        for segment in sorted(path.parent.glob(f"{path.stem}.part*{suffix}"))
-        if segment.stat().st_size > MAX_BYTES
-    ]
-    if too_big:
-        raise RuntimeError("ffmpeg parts are still too large: " + ", ".join(too_big[:3]))
-    raise RuntimeError(last_error or "ffmpeg did not create media parts")
-
-
-def probe_media_duration(path: Path) -> float | None:
-    if not shutil.which("ffprobe"):
-        return None
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=nokey=1:noprint_wrappers=1",
-        str(path),
-    ]
-    result = subprocess.run(cmd, text=True, capture_output=True, timeout=60)
-    if result.returncode != 0:
-        return None
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        return None
-
-
-def normalized_segment_suffix(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix in {".mp4", ".m4v", ".mov"}:
-        return ".mp4"
-    if suffix in {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".webm"}:
-        return suffix
-    return ".mp4"
-
-
-def cleanup_existing_segments(directory: Path, stem: str, suffix: str) -> None:
-    for segment in directory.glob(f"{stem}.part*{suffix}"):
-        segment.unlink(missing_ok=True)
-
-
-def create_concat_list(workdir: Path, original_name: str, segments: list[Path]) -> Path:
-    concat_list = workdir / f"{original_name}.concat.txt"
-    lines = [f"file '{segment.name.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'" for segment in segments]
-    concat_list.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return concat_list
 
 
 def send_media_preview(chat_id: int, path: Path, caption: str) -> bool:

@@ -468,6 +468,27 @@ class UserReplicaTests(unittest.TestCase):
         self.assertIn(send_message.call_args_list[1].args[1], bot.FILE_READY_MESSAGES)
         upload.assert_called_once_with(123, media, caption="", mode=bot.LARGE_UPLOAD_MODE)
 
+    def test_large_upload_without_large_file_route_fails_instead_of_splitting(self):
+        media = FakeFile("large.mp4", size=bot.MAX_BYTES + 1)
+
+        with patch.object(bot, "mtproto_upload_available", return_value=False):
+            with patch.object(bot, "send_message"):
+                with patch.object(bot, "send_small_media_and_document") as send_small:
+                    with self.assertRaisesRegex(RuntimeError, "Large file upload is not configured"):
+                        bot.send_media_and_document(123, media)
+
+        send_small.assert_not_called()
+
+    def test_mtproto_upload_failure_does_not_fall_back_to_splitting(self):
+        media = FakeFile("large.mp4", size=bot.MAX_BYTES + 1)
+
+        with patch.object(bot, "mtproto_upload_available", return_value=True):
+            with patch.object(bot, "MTPROTO_MAX_BYTES", media.stat().st_size + 1024):
+                with patch.object(bot, "send_large_media_via_mtproto", side_effect=RuntimeError("boom")):
+                    with patch.object(bot, "send_message"):
+                        with self.assertRaisesRegex(RuntimeError, "MTProto upload failed"):
+                            bot.send_media_and_document(123, media)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,4 +37,4 @@ Supported routes:
 - Use the regular Bot API for files that fit the configured bot limit.
 - Use a local Telegram Bot API server when configured.
 - Use MTProto upload via Telethon when credentials are configured.
-- Fall back to FFmpeg segmenting into playable parts if MTProto is unavailable.
+- Do not split large media into parts; configure a single-file large upload route for files over the cloud Bot API limit.

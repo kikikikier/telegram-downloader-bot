@@ -37,7 +37,7 @@ FFmpeg merge is disabled by default. Set `BOT_ENABLE_FFMPEG_MERGE=1` only if you
 
 - Python 3.10+
 - Python packages from `requirements.txt`
-- Optional FFmpeg for audio extraction, media splitting, or explicit yt-dlp merge fallback
+- Optional FFmpeg for audio extraction or explicit yt-dlp merge fallback
 - Optional local Telegram Bot API server for larger bot uploads
 - Optional Telegram API credentials for MTProto uploads through Telethon
 
@@ -67,7 +67,7 @@ Upload route:
 1. If the file fits `BOT_MAX_MB`, send through Bot API.
 2. If `BOT_API_LOCAL=1` and `BOT_API_BASE` points to a local `telegram-bot-api --local` server, Bot API can upload up to 2000 MB using `file://` local paths.
 3. If `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are configured, files over cloud Bot API limits are sent through MTProto/Telethon.
-4. If MTProto is unavailable or fails, FFmpeg splits media into playable parts.
+4. If no single-file large upload route is configured, the bot fails the job clearly instead of splitting the media into parts.
 
 Cloud `api.telegram.org` still has the classic bot upload limit. For serious large files, use either a local Bot API server or MTProto credentials.
 
