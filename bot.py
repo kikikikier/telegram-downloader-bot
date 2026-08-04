@@ -959,6 +959,15 @@ def delayed_workdir_cleanup(workdir: Path, delay: int) -> None:
     remove_workdir_if_due(workdir, reason="delayed")
 
 
+def cleanup_workdir_after_job(workdir: Path, reason: str = "job-finished") -> None:
+    try:
+        (workdir / ".active").unlink(missing_ok=True)
+        (workdir / ".delete_after").unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning("could not clear workdir markers path=%s error=%s", workdir, short_error(exc))
+    force_remove_workdir(workdir, reason=reason)
+
+
 def cleanup_due_workdirs(reason: str) -> None:
     try:
         workdirs = [path for path in TMP_ROOT.iterdir() if path.is_dir()]
@@ -1049,19 +1058,19 @@ def force_remove_workdir(workdir: Path, reason: str) -> None:
 
 def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str | None = "720") -> None:
     workdir = TMP_ROOT / uuid.uuid4().hex
-    workdir.mkdir(parents=True, exist_ok=True)
-    mark_workdir_active(workdir)
     started_at = time.monotonic()
     progress = None
-    logger.info(
-        "job start chat_id=%s mode=%s quality=%s url=%s workdir=%s",
-        chat_id,
-        media_mode,
-        quality,
-        safe_log_url(url),
-        workdir,
-    )
     try:
+        workdir.mkdir(parents=True, exist_ok=True)
+        mark_workdir_active(workdir)
+        logger.info(
+            "job start chat_id=%s mode=%s quality=%s url=%s workdir=%s",
+            chat_id,
+            media_mode,
+            quality,
+            safe_log_url(url),
+            workdir,
+        )
         send_message(chat_id, pick(ACCEPT_MESSAGES))
         progress = start_progress_message(chat_id, label="Готовлю ссылку")
         if progress:
@@ -1129,7 +1138,7 @@ def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str |
             progress.fail()
         send_message(chat_id, pick(ERROR_MESSAGES))
     finally:
-        schedule_workdir_cleanup(workdir)
+        cleanup_workdir_after_job(workdir)
 
 
 def download_direct(url: str, workdir: Path, progress: DownloadProgressReporter | None = None) -> Path:

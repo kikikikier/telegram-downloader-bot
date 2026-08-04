@@ -29,6 +29,7 @@ class FakeFile:
 
 class FakeWorkdir:
     def __init__(self, files=None):
+        self.name = "fake-workdir"
         self.files = files or []
 
     def __str__(self):
@@ -45,6 +46,11 @@ class FakeWorkdir:
 
     def rglob(self, pattern):
         return self.files
+
+
+class FailingMkdirWorkdir(FakeWorkdir):
+    def mkdir(self, parents=False, exist_ok=False):
+        raise OSError("No space left on device")
 
 
 class FakeTmpRoot:
@@ -233,7 +239,7 @@ class YtdlpFormatTests(unittest.TestCase):
 
         with patch.object(bot, "TMP_ROOT", FakeTmpRoot(workdir)):
             with patch.object(bot, "mark_workdir_active"):
-                with patch.object(bot, "schedule_workdir_cleanup"):
+                with patch.object(bot, "cleanup_workdir_after_job"):
                     with patch.object(bot, "download_media_files_for_url", create=True, return_value=paths):
                         with patch.object(bot, "download_media_for_url", return_value=paths[0]):
                             with patch.object(bot, "send_message"):
@@ -266,7 +272,7 @@ class YtdlpFormatTests(unittest.TestCase):
 
         with patch.object(bot, "TMP_ROOT", FakeTmpRoot(workdir)):
             with patch.object(bot, "mark_workdir_active"):
-                with patch.object(bot, "schedule_workdir_cleanup"):
+                with patch.object(bot, "cleanup_workdir_after_job"):
                     with patch.object(bot, "download_media_files_for_url", create=True, return_value=[path]):
                         with patch.object(bot, "send_message"):
                             with patch.object(bot, "send_image_gallery") as send_gallery:
@@ -525,6 +531,32 @@ class YtdlpFormatTests(unittest.TestCase):
 
 
 class UserReplicaTests(unittest.TestCase):
+    def test_handle_url_removes_workdir_immediately_after_upload(self):
+        media = FakeFile("clip.mp4")
+        workdir = FakeWorkdir([media])
+
+        with patch.object(bot, "TMP_ROOT", FakeTmpRoot(workdir)):
+            with patch.object(bot, "start_progress_message", return_value=None):
+                with patch.object(bot, "download_media_files_for_url", return_value=[media]):
+                    with patch.object(bot, "send_message"):
+                        with patch.object(bot, "send_media_and_document"):
+                            with patch.object(bot, "force_remove_workdir") as remove:
+                                bot.handle_url(123, "https://www.youtube.com/watch?v=videoid")
+
+        remove.assert_called_once_with(workdir, reason="job-finished")
+
+    def test_handle_url_reports_workdir_creation_failure(self):
+        workdir = FailingMkdirWorkdir()
+
+        with patch.object(bot, "TMP_ROOT", FakeTmpRoot(workdir)):
+            with patch.object(bot, "send_message") as send_message:
+                with patch.object(bot, "cleanup_workdir_after_job") as cleanup:
+                    bot.handle_url(123, "https://www.youtube.com/watch?v=videoid")
+
+        self.assertEqual(1, send_message.call_count)
+        self.assertIn(send_message.call_args.args[1], bot.ERROR_MESSAGES)
+        cleanup.assert_called_once_with(workdir)
+
     def test_main_user_replica_sets_have_200_unique_messages_each(self):
         replica_sets = (
             bot.ACCEPT_MESSAGES,
@@ -595,7 +627,7 @@ class UserReplicaTests(unittest.TestCase):
         progress_obj = progress
         with patch.object(bot, "TMP_ROOT", FakeTmpRoot(workdir)):
             with patch.object(bot, "mark_workdir_active"):
-                with patch.object(bot, "schedule_workdir_cleanup"):
+                with patch.object(bot, "cleanup_workdir_after_job"):
                     with patch.object(bot, "start_progress_message", return_value=progress):
                         with patch.object(bot, "download_media_files_for_url", return_value=[media]):
                             with patch.object(bot, "send_message"):
