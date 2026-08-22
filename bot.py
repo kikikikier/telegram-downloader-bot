@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import collections
+import hashlib
 import json
 import logging
 import mimetypes
@@ -112,6 +113,7 @@ MEDIA_SUFFIXES = {
 VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".m4v", ".mkv"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 PHOTO_ALBUM_SUFFIXES = {".jpg", ".jpeg", ".png"}
+AUDIO_SUFFIXES = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
 MEDIA_GROUP_LIMIT = 10
 
 SUPPORTED_HOST_HINTS = (
@@ -145,6 +147,7 @@ VIDEO_QUALITIES = ("144", "240", "360", "480", "720", "1080", "1440", "2160", "4
 PENDING_TTL_SECONDS = 60 * 60
 PENDING_DOWNLOADS: dict[str, dict] = {}
 CLEANUP_THREAD_STARTED = False
+MONITOR_LOG_LOCK = threading.Lock()
 
 START_TEXT = (
     "Пришли ссылку на публичное медиа. Ожидайте, не верьте дверным ручкам. "
@@ -398,6 +401,27 @@ def is_instagram_reel_url(url: str) -> bool:
 
 def is_tiktok_url(url: str) -> bool:
     return url_host_matches(url, ("tiktok.com", "tiktokv.com", "vm.tiktok.com", "vt.tiktok.com"))
+
+
+def is_rutube_url(url: str) -> bool:
+    return url_host_matches(url, ("rutube.ru", "rutube.com", "rutube.me"))
+
+
+def platform_for_url(url: str) -> str:
+    if DIRECT_MEDIA_RE.search(url):
+        return "direct"
+    if is_youtube_url(url):
+        return "youtube"
+    if is_tiktok_url(url):
+        return "tiktok"
+    if is_instagram_url(url):
+        return "instagram"
+    if is_vk_video_url(url):
+        return "vk"
+    if is_rutube_url(url):
+        return "rutube"
+    host = urllib.parse.urlparse(url).netloc.lower().removeprefix("www.")
+    return host or "other"
 
 
 def is_gallery_first_url(url: str) -> bool:
@@ -1059,17 +1083,29 @@ def force_remove_workdir(workdir: Path, reason: str) -> None:
 def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str | None = "720") -> None:
     workdir = TMP_ROOT / uuid.uuid4().hex
     started_at = time.monotonic()
+    platform = platform_for_url(url)
+    url_hash = url_log_hash(url)
     progress = None
     try:
         workdir.mkdir(parents=True, exist_ok=True)
         mark_workdir_active(workdir)
         logger.info(
-            "job start chat_id=%s mode=%s quality=%s url=%s workdir=%s",
+            "job start chat_id=%s platform=%s mode=%s quality=%s url_hash=%s url=%s workdir=%s",
             chat_id,
+            platform,
             media_mode,
             quality,
+            url_hash,
             safe_log_url(url),
             workdir,
+        )
+        monitor_download_event(
+            "job_start",
+            url,
+            media_mode=media_mode,
+            quality=quality,
+            chat_id=chat_id,
+            workdir=str(workdir),
         )
         send_message(chat_id, pick(ACCEPT_MESSAGES))
         progress = start_progress_message(chat_id, label="Готовлю ссылку")
@@ -1087,16 +1123,35 @@ def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str |
         if not media_paths:
             if progress:
                 progress.fail()
+            monitor_download_event(
+                "download_empty",
+                url,
+                media_mode=media_mode,
+                quality=quality,
+                chat_id=chat_id,
+            )
             send_message(chat_id, pick(NOT_FOUND_MESSAGES))
             return
 
         total_size = sum(path.stat().st_size for path in media_paths)
         if progress:
             progress.update(70, label="Проверяю файл", force=True)
+        media_summary = summarize_media_paths(media_paths)
         logger.info(
-            "download complete files=%s size=%s",
+            "download complete platform=%s url_hash=%s files=%s size=%s summary=%s",
+            platform,
+            url_hash,
             ", ".join(path.name for path in media_paths),
             human_size(total_size),
+            compact_json(media_summary),
+        )
+        monitor_download_event(
+            "download_complete",
+            url,
+            media_mode=media_mode,
+            quality=quality,
+            paths=media_paths,
+            chat_id=chat_id,
         )
         send_message(chat_id, pick(DOWNLOADED_MESSAGES))
         if is_image_gallery(media_paths):
@@ -1122,18 +1177,62 @@ def handle_url(chat_id: int, url: str, media_mode: str = "video", quality: str |
         if progress:
             progress.finish()
         logger.info(
-            "job done chat_id=%s files=%s elapsed=%.1fs",
+            "job done chat_id=%s platform=%s url_hash=%s files=%s elapsed=%.1fs",
             chat_id,
+            platform,
+            url_hash,
             len(media_paths),
             time.monotonic() - started_at,
         )
-    except subprocess.TimeoutExpired:
-        logger.exception("job timeout chat_id=%s url=%s", chat_id, safe_log_url(url))
+        monitor_download_event(
+            "job_done",
+            url,
+            media_mode=media_mode,
+            quality=quality,
+            paths=media_paths,
+            chat_id=chat_id,
+            elapsed_seconds=round(time.monotonic() - started_at, 1),
+        )
+    except subprocess.TimeoutExpired as exc:
+        logger.exception(
+            "job timeout chat_id=%s platform=%s url_hash=%s url=%s",
+            chat_id,
+            platform,
+            url_hash,
+            safe_log_url(url),
+        )
+        monitor_download_event(
+            "job_timeout",
+            url,
+            media_mode=media_mode,
+            quality=quality,
+            chat_id=chat_id,
+            error=exc,
+            elapsed_seconds=round(time.monotonic() - started_at, 1),
+        )
         if progress:
             progress.fail()
         send_message(chat_id, pick(TIMEOUT_MESSAGES))
     except Exception as exc:
-        logger.exception("job failed chat_id=%s url=%s error=%s", chat_id, safe_log_url(url), short_error(exc))
+        logger.exception(
+            "job failed chat_id=%s platform=%s mode=%s quality=%s url_hash=%s url=%s error=%s",
+            chat_id,
+            platform,
+            media_mode,
+            quality,
+            url_hash,
+            safe_log_url(url),
+            short_error(exc),
+        )
+        monitor_download_event(
+            "job_failed",
+            url,
+            media_mode=media_mode,
+            quality=quality,
+            chat_id=chat_id,
+            error=exc,
+            elapsed_seconds=round(time.monotonic() - started_at, 1),
+        )
         if progress:
             progress.fail()
         send_message(chat_id, pick(ERROR_MESSAGES))
@@ -1206,10 +1305,40 @@ def download_media_files_for_url(
     progress: DownloadProgressReporter | None = None,
 ) -> list[Path]:
     if DIRECT_MEDIA_RE.search(url):
+        logger.info(
+            "download route platform=%s downloader=direct mode=%s quality=%s url_hash=%s url=%s",
+            platform_for_url(url),
+            media_mode,
+            quality,
+            url_log_hash(url),
+            safe_log_url(url),
+        )
+        monitor_download_event(
+            "download_route",
+            url,
+            media_mode=media_mode,
+            quality=quality,
+            downloader="direct",
+        )
         return [download_direct(url, workdir, progress=progress)]
 
     if is_gallery_first_url(url) and media_mode == "video":
         try:
+            logger.info(
+                "download route platform=%s downloader=gallery-dl mode=%s quality=%s url_hash=%s url=%s",
+                platform_for_url(url),
+                media_mode,
+                quality,
+                url_log_hash(url),
+                safe_log_url(url),
+            )
+            monitor_download_event(
+                "download_route",
+                url,
+                media_mode=media_mode,
+                quality=quality,
+                downloader="gallery-dl",
+            )
             gallery_files = download_with_gallery_dl(url, workdir, progress=progress)
             if should_retry_gallery_result_with_ytdlp(url, media_mode, gallery_files):
                 logger.warning(
@@ -1226,6 +1355,21 @@ def download_media_files_for_url(
                 short_error(exc),
             )
 
+    logger.info(
+        "download route platform=%s downloader=yt-dlp mode=%s quality=%s url_hash=%s url=%s",
+        platform_for_url(url),
+        media_mode,
+        quality,
+        url_log_hash(url),
+        safe_log_url(url),
+    )
+    monitor_download_event(
+        "download_route",
+        url,
+        media_mode=media_mode,
+        quality=quality,
+        downloader="yt-dlp",
+    )
     if progress:
         return download_files_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality, progress=progress)
     return download_files_with_ytdlp(url, workdir, media_mode=media_mode, quality=quality)
@@ -1269,10 +1413,55 @@ def download_with_gallery_dl(
     if progress:
         run_kwargs["on_output_line"] = progress.handle_gallery_line
     returncode, output = run_logged_command(cmd, **run_kwargs)
+    try:
+        files = select_downloaded_media_files(workdir)
+    except RuntimeError:
+        files = []
     if returncode != 0:
-        raise RuntimeError(output or "gallery-dl failed")
+        if files:
+            logger.warning(
+                "gallery-dl partial result accepted platform=%s url_hash=%s returncode=%s files=%s summary=%s output=%s",
+                platform_for_url(url),
+                url_log_hash(url),
+                returncode,
+                ", ".join(path.name for path in files),
+                compact_json(summarize_media_paths(files)),
+                short_error(output or "gallery-dl failed"),
+            )
+            monitor_download_event(
+                "downloader_partial_success",
+                url,
+                downloader="gallery-dl",
+                returncode=returncode,
+                paths=files,
+                output=short_error(output or "gallery-dl failed"),
+            )
+            return files
+        exc = RuntimeError(output or "gallery-dl failed")
+        monitor_download_event(
+            "downloader_failed",
+            url,
+            downloader="gallery-dl",
+            returncode=returncode,
+            error=exc,
+        )
+        raise exc
 
-    return select_downloaded_media_files(workdir)
+    logger.info(
+        "gallery-dl complete platform=%s url_hash=%s files=%s summary=%s",
+        platform_for_url(url),
+        url_log_hash(url),
+        ", ".join(path.name for path in files),
+        compact_json(summarize_media_paths(files)),
+    )
+    monitor_download_event(
+        "downloader_complete",
+        url,
+        downloader="gallery-dl",
+        returncode=returncode,
+        paths=files,
+    )
+    return files
 
 
 def download_with_ytdlp(
@@ -1355,9 +1544,36 @@ def download_files_with_ytdlp(
     }
     if progress:
         run_kwargs["on_output_line"] = progress.handle_ytdlp_line
+    logger.info(
+        "yt-dlp selected platform=%s mode=%s quality=%s format=%s url_hash=%s url=%s",
+        platform_for_url(url),
+        media_mode,
+        quality,
+        format_selector if media_mode != "audio" else "bestaudio/best",
+        url_log_hash(url),
+        safe_log_url(url),
+    )
+    monitor_download_event(
+        "downloader_start",
+        url,
+        media_mode=media_mode,
+        quality=quality,
+        downloader="yt-dlp",
+        format=format_selector if media_mode != "audio" else "bestaudio/best",
+    )
     returncode, output = run_logged_command(cmd, **run_kwargs)
     if returncode != 0:
-        raise RuntimeError(output or "yt-dlp failed")
+        exc = RuntimeError(output or "yt-dlp failed")
+        monitor_download_event(
+            "downloader_failed",
+            url,
+            media_mode=media_mode,
+            quality=quality,
+            downloader="yt-dlp",
+            returncode=returncode,
+            error=exc,
+        )
+        raise exc
 
     files = [
         path for path in workdir.rglob("*")
@@ -1383,6 +1599,24 @@ def download_files_with_ytdlp(
             raise RuntimeError(
                 f"Downloaded media is over the current upload limit {human_size(size_limit)}: {names}"
             )
+    logger.info(
+        "yt-dlp complete platform=%s mode=%s quality=%s url_hash=%s files=%s summary=%s",
+        platform_for_url(url),
+        media_mode,
+        quality,
+        url_log_hash(url),
+        ", ".join(path.name for path in selected),
+        compact_json(summarize_media_paths(selected)),
+    )
+    monitor_download_event(
+        "downloader_complete",
+        url,
+        media_mode=media_mode,
+        quality=quality,
+        downloader="yt-dlp",
+        returncode=returncode,
+        paths=selected,
+    )
     return selected
 
 
@@ -1554,6 +1788,138 @@ def safe_log_url(url: str) -> str:
         return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
     except Exception:
         return "[url]"
+
+
+def url_log_hash(url: str) -> str:
+    return hashlib.sha256(url.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def media_type_for_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in VIDEO_SUFFIXES:
+        return "video"
+    if suffix in IMAGE_SUFFIXES:
+        return "image"
+    if suffix in AUDIO_SUFFIXES:
+        return "audio"
+    return "other"
+
+
+def summarize_media_paths(paths: list[Path]) -> dict:
+    counts: collections.Counter[str] = collections.Counter()
+    suffixes: collections.Counter[str] = collections.Counter()
+    total_bytes = 0
+    files = []
+    for path in paths:
+        counts[media_type_for_path(path)] += 1
+        suffixes[path.suffix.lower() or "[none]"] += 1
+        try:
+            size = path.stat().st_size
+        except Exception:
+            size = 0
+        total_bytes += size
+        if len(files) < 20:
+            files.append({"name": path.name, "bytes": size, "type": media_type_for_path(path)})
+    return {
+        "media_total_bytes": total_bytes,
+        "media_total_size": human_size(total_bytes),
+        "media_counts": dict(sorted(counts.items())),
+        "media_suffixes": dict(sorted(suffixes.items())),
+        "media_files": files,
+    }
+
+
+def monitor_download_event(
+    event: str,
+    url: str,
+    media_mode: str | None = None,
+    quality: str | None = None,
+    paths: list[Path] | None = None,
+    error: BaseException | None = None,
+    **fields,
+) -> None:
+    payload = {
+        "platform": platform_for_url(url),
+        "safe_url": safe_log_url(url),
+        "url_hash": url_log_hash(url),
+    }
+    if media_mode is not None:
+        payload["media_mode"] = media_mode
+    if quality is not None:
+        payload["quality"] = quality
+    if paths is not None:
+        payload.update(summarize_media_paths(paths))
+    if error is not None:
+        payload["error_class"] = type(error).__name__
+        payload["error"] = short_error(error)
+    payload.update(fields)
+    write_monitor_event(event, **payload)
+
+
+def write_monitor_event(event: str, **fields) -> None:
+    path = monitor_log_path()
+    if path is None:
+        return
+    payload = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": event,
+    }
+    payload.update({key: json_safe_monitor_value(value) for key, value in fields.items()})
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    try:
+        with MONITOR_LOG_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            rotate_monitor_log_if_needed(path)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+    except Exception as exc:
+        logger.warning("monitor event write failed path=%s error=%s", path, short_error(exc))
+
+
+def monitor_log_path() -> Path | None:
+    raw = os.environ.get("BOT_MONITOR_LOG", "logs/download-events.jsonl").strip()
+    if not raw or raw.lower() in {"0", "false", "no", "off", "none"}:
+        return None
+    return Path(raw)
+
+
+def monitor_max_bytes() -> int:
+    raw = os.environ.get("BOT_MONITOR_MAX_BYTES", str(5 * 1024 * 1024)).strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 5 * 1024 * 1024
+
+
+def rotate_monitor_log_if_needed(path: Path) -> None:
+    max_bytes = monitor_max_bytes()
+    if not max_bytes:
+        return
+    try:
+        if not path.exists() or path.stat().st_size <= max_bytes:
+            return
+        rotated = path.with_name(path.name + ".1")
+        rotated.unlink(missing_ok=True)
+        path.replace(rotated)
+        logger.info("monitor log rotated path=%s rotated=%s max_bytes=%s", path, rotated, max_bytes)
+    except Exception as exc:
+        logger.warning("monitor log rotation failed path=%s error=%s", path, short_error(exc))
+
+
+def json_safe_monitor_value(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): json_safe_monitor_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe_monitor_value(item) for item in value]
+    return str(value)
+
+
+def compact_json(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def safe_target(workdir: Path, name: str) -> Path:
@@ -2033,7 +2399,9 @@ def human_size(value: int) -> str:
 
 
 def short_error(exc: Exception) -> str:
-    text = str(exc).strip().replace(TOKEN, "[token]")
+    text = str(exc).strip()
+    if TOKEN:
+        text = text.replace(TOKEN, "[token]")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines[-4:])[:1000] or exc.__class__.__name__
 

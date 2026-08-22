@@ -77,6 +77,10 @@ class UrlSupportTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertTrue(bot.is_supported_url(url))
 
+    def test_short_error_does_not_expand_empty_token_between_characters(self):
+        with patch.object(bot, "TOKEN", ""):
+            self.assertEqual("404 Not Found", bot.short_error(RuntimeError("404 Not Found")))
+
 
 class YtdlpFormatTests(unittest.TestCase):
     def test_instagram_video_download_uses_gallery_dl_and_returns_video_file(self):
@@ -229,6 +233,50 @@ class YtdlpFormatTests(unittest.TestCase):
             )
 
         self.assertEqual(["photo-2.jpg", "photo-3.png", "photo-1.jpg"], [path.name for path in paths])
+
+    def test_gallery_dl_keeps_partial_media_when_some_items_fail(self):
+        workdir = FakeWorkdir([
+            FakeFile("photo-1.jpg", size=1_000_000, mtime=1),
+            FakeFile("photo-2.jpg", size=2_000_000, mtime=2),
+        ])
+
+        with patch.object(bot, "run_logged_command", return_value=(4, "404 Not Found")):
+            paths = bot.download_with_gallery_dl(
+                "https://vt.tiktok.com/ZSVPg4nQ8/",
+                workdir,
+            )
+
+        self.assertEqual(["photo-2.jpg", "photo-1.jpg"], [path.name for path in paths])
+
+    def test_monitor_event_logs_platform_hash_and_media_summary_without_query(self):
+        events = []
+        paths = [
+            FakeFile("clip.mp4", size=5_000_000),
+            FakeFile("photo.jpg", size=2_000_000),
+            FakeFile("sound.mp3", size=1_000_000),
+        ]
+
+        with patch.object(bot, "write_monitor_event", side_effect=lambda event, **fields: events.append((event, fields))):
+            bot.monitor_download_event(
+                "job_failed",
+                "https://www.youtube.com/watch?v=videoid&token=secret",
+                media_mode="video",
+                quality="720",
+                paths=paths,
+                error=RuntimeError("HTTP Error 403: Forbidden"),
+            )
+
+        event, fields = events[0]
+        self.assertEqual("job_failed", event)
+        self.assertEqual("youtube", fields["platform"])
+        self.assertEqual("video", fields["media_mode"])
+        self.assertEqual("720", fields["quality"])
+        self.assertEqual(8_000_000, fields["media_total_bytes"])
+        self.assertEqual({"audio": 1, "image": 1, "video": 1}, fields["media_counts"])
+        self.assertEqual("RuntimeError", fields["error_class"])
+        self.assertIn("watch", fields["safe_url"])
+        self.assertNotIn("token=secret", fields["safe_url"])
+        self.assertNotIn("videoid", fields["url_hash"])
 
     def test_handle_url_sends_downloaded_images_as_one_gallery_album(self):
         paths = [
